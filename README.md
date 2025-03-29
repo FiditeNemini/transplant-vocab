@@ -51,8 +51,8 @@ python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-D
 
 # With manual token overrides for chat templates (see below)
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B \
-	--override "<｜User｜>" "<|im_start|>user\\n"
-	--override "<｜Assistant｜>" "<|im_start|>assistant\\n"
+	--override "<｜User｜>" "<|im_start|>user\\n" \
+	--override "<｜Assistant｜>" "<|im_start|>assistant\\n" \
 	--override ...
 ```
 

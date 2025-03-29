@@ -10,6 +10,7 @@ This tool allows you to combine the transformer architecture and weights from a 
 - Adapt donor model to use the target model's tokenizer.
 - Automatic special tokens mapping between models.
 - User-specified manual token mapping overrides.
+- (**only useful for fine-tuning**) Models can be "trimmed" by removing a range of layers.
 
 ## Installation
 
@@ -36,6 +37,7 @@ python transplant_vocab.py /path/to/donor_model /path/to/target_model /path/to/o
 |------|-------------|
 | `--override TARGET DONOR` | Override target token with donor token (can be used multiple times) |
 | `--weighting-decay-factor [0-1]` | Decay factor for multi-token mappings: 0=first token only, 0.5=decreasing weights, 1=uniform mean |
+| `--trim-layers START-END` | Trim out a range of layers from the model: start-end (inclusive) |
 | `--use-cpu-only` | Use CPU instead of GPU (and with `float32` precision) |
 | `--trust-remote-code` | Allow custom code execution when loading models with non-standard architectures |
 | `--overwrite` | Replace existing output directory |
@@ -75,6 +77,14 @@ Use decreasing weights (eg: 1, 0.5, 0.25, etc.) for `lm_head` averaging (default
 ```bash
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-decay --weighting-decay-factor 0.5
 ```
+
+Trim out intermediate layers to create a smaller model that we can use for further fine-tuning:
+
+```bash
+python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-trimmed --trim-layers 14-21
+```
+
+(*eg: this leaves us with a model which has 16 layer in total: 14 taken from the start and 2 from the end of the donor model*)
 
 ### Token Mapping
 
@@ -182,6 +192,34 @@ Transplanting tokens:
 ```
 
 and also to explore other possible manual overrides...
+
+## Layer Trimming
+
+The `--trim-layers` option allows you to remove a range of intermediate layers from the model. This can be useful for several reasons:
+
+### Benefits of Layer Trimming
+
+- **Faster Inference**: Smaller models with fewer layers require less computation, resulting in faster inference times. This is particularly valuable for speculative decoding where draft model speed is critical.
+- **Reduced Memory Usage**: Trimmed models consume less GPU memory, allowing deployment on more modest hardware.
+- **More Efficient Fine-tuning**: Smaller models are faster and cheaper to fine-tune.
+
+### Important Considerations
+
+- **Performance Impact**: Unlike vocabulary transplantation (which preserves most of the model's capabilities), layer trimming significantly impacts model performance. ***The resulting model will require fine-tuning*** to recover acceptable performance.
+- **Layer Selection Strategy**: Research such as ["The Unreasonable Ineffectiveness of the Deeper Layers"](https://arxiv.org/abs/2403.17887) suggests that not all layers contribute equally to model performance.
+- **Recommended Approach**: When trimming layers, it's generally advisable to:
+  - Keep the very early layers (which transform embedding-space to hidden/latent representations)
+  - Keep the early-intermediate layers (which store/transform useful semantic information)
+  - Keep the final 1-2 layers (which transform hidden/latent representations to logit-space)
+  - Remove the later-intermediate layers (which often contain redundant information)
+
+### Example Trimming Strategy
+
+For a 24-layer model like `Qwen2.5-0.5B-Instruct`, you might use `--trim-layers 14-21`:
+
+This keeps layers 0-13 (the first 14 layers) and layers 22-23 (the final 2 layers), resulting in a 16-layer model that preserves both the input processing and output generation capabilities while removing 8 of the (later) intermediate layers. The resulting model will be approximately 2/3 the size and should run approximately 33% faster for speculative decoding.
+
+**IMPORTANT**: After trimming, you ***must fine-tune*** the model to recover performance. The trimmed model can serve as an excellent starting point for creating a smaller, faster draft model through additional fine-tuning, but it is ***unlikely to be useful without further fine-tuning***.
 
 ## Design Rationale
 

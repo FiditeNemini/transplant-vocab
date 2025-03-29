@@ -34,6 +34,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--weighting-decay-factor", type = float, default = 0.5,
                        help = "Decay factor [0-1] for multi-token mappings: "
                             "0=first token only, 0.5=decreasing weights, 1=uniform mean")
+    parser.add_argument("--trim-layers", type = str,
+                       help = "Trim out a range of layers from the model: start-end (inclusive)")
     parser.add_argument("--use-cpu-only", action = "store_true",
                        help = "Use CPU only for model loading and processing in float32")
     parser.add_argument("--trust-remote-code", action = "store_true",
@@ -47,6 +49,14 @@ def parse_arguments() -> argparse.Namespace:
 
     if not (0.0 <= args.weighting_decay_factor <= 1.0):
         sys.exit(f"Error: --weighting-decay-factor must be between 0.0 and 1.0 (got {args.weighting_decay_factor})")
+
+    if args.trim_layers:
+        try:
+            start, end = map(int, args.trim_layers.split('-'))
+            if start < 0 or end < start:
+                sys.exit(f"Error: Invalid layer range: {args.trim_layers}. Format should be start-end with start ≥ 0 and end ≥ start")
+        except ValueError:
+            sys.exit(f"Error: Invalid layer range format: {args.trim_layers}. Format should be start-end (e.g., 3-8)")
 
     return args
 
@@ -151,6 +161,91 @@ def compute_front_loaded_mean(v, weighting_decay_factor = 0.5):
         weighted_sum = torch.sum(decay_powers * v, dim = 0)
         denominator = torch.sum(decay_powers)
         return weighted_sum / denominator
+
+def trim_model_layers(model, state_dict, start_layer, end_layer):
+    """
+    Trim out a range of layers from the model and its state_dict.
+    
+    Args:
+        model: The model to modify
+        state_dict: The state dictionary to modify
+        start_layer: The first layer to remove (inclusive)
+        end_layer: The last layer to remove (inclusive)
+    
+    Returns:
+        Tuple of (modified model, modified state_dict)
+    """
+    print(f"\nTrimming layers {start_layer} through {end_layer} (inclusive): ")
+
+    # Get the total number of layers in the model
+    assert hasattr(model.config, 'num_hidden_layers'), "Could not determine the number of layers in the model"
+    total_layers = model.config.num_hidden_layers
+
+    assert end_layer < total_layers, f"End layer {end_layer} exceeds the total number of layers {total_layers}"
+
+    # Calculate how many layers to keep
+    new_layer_count = total_layers - (end_layer - start_layer + 1)
+    print(f"- Old layer count : {total_layers} (layers 0-{total_layers-1})")
+    print(f"- New layer count : {new_layer_count} (keeping layers 0-{start_layer-1} and {end_layer+1}-{total_layers-1})")
+
+    # Create a mapping from old layer indices to new layer indices
+    layer_mapping = {}
+    new_idx = 0
+    for old_idx in range(total_layers):
+        if old_idx < start_layer or old_idx > end_layer:
+            layer_mapping[old_idx] = new_idx
+            new_idx += 1
+
+    # Create a new state dict with trimmed layers
+    new_state_dict = {}
+    removed_keys = []
+
+    for key, tensor in state_dict.items():
+        # Check if this key corresponds to a layer that should be removed
+        layer_match = None
+
+        # Match patterns like 'model.layers.5.self_attn.q_proj.weight'
+        import re
+        for pattern in [r'model\.layers\.(\d+)\.', r'transformer\.h\.(\d+)\.', r'model\.decoder\.layers\.(\d+)\.']:
+            match = re.search(pattern, key)
+            if match:
+                layer_idx = int(match.group(1))
+                if start_layer <= layer_idx <= end_layer:
+                    removed_keys.append(key)
+                    layer_match = match
+                    break
+                else:
+                    # This layer is kept, but we need to renumber it
+                    new_layer_idx = layer_mapping[layer_idx]
+                    new_key = key.replace(match.group(0), match.group(0).replace(str(layer_idx), str(new_layer_idx)))
+                    # Create a new tensor to avoid shared memory issues
+                    new_state_dict[new_key] = tensor.clone()
+                    break
+
+        # If no layer match was found, keep the tensor as is
+        if layer_match is None:
+            new_state_dict[key] = tensor.clone()
+
+    # Update the model configuration
+    model.config.num_hidden_layers = new_layer_count
+
+    # Also update nested configurations if present (for models like Gemma, Llama, etc.)
+    if hasattr(model.config, 'text_config') and hasattr(model.config.text_config, 'num_hidden_layers'):
+        model.config.text_config.num_hidden_layers = new_layer_count
+
+    # For models with specific architectures, we might need to modify the layers list
+    if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+        # Create a new ModuleList with only the layers we want to keep
+        new_layers = nn.ModuleList()
+        for i, layer in enumerate(model.model.layers):
+            if i < start_layer or i > end_layer:
+                new_layers.append(layer)
+        model.model.layers = new_layers
+
+    print(f"- Removed a total of {len(removed_keys)} tensors from state_dict.")
+    print(f"- Updated model configuration so `num_hidden_layers = {new_layer_count}`.")
+
+    return model, new_state_dict
 
 def main():
     args = parse_arguments()
@@ -333,6 +428,11 @@ def main():
     # Update the state_dict with new embeddings
     new_state_dict['model.embed_tokens.weight'] = new_embed_tokens.to(dtype = old_dtype)
     new_state_dict['lm_head.weight'] = new_lm_head.to(dtype = old_dtype)
+
+    # Trim layers if requested
+    if args.trim_layers:
+        start_layer, end_layer = map(int, args.trim_layers.split('-'))
+        model, new_state_dict = trim_model_layers(model, new_state_dict, start_layer, end_layer)
 
     # Update model architecture
     model.model.embed_tokens.num_embeddings = target_vocab_size

@@ -29,11 +29,13 @@ python transplant_embeddings.py /path/to/donor_model /path/to/target_model /path
 ```
 
 ### Options
+
 | Flag | Description |
 |------|-------------|
 | `--overwrite` | Replace existing output directory |
 | `--unmapped-init-scale [0-1]` | Initialize unmapped output tokens with scaled mean embeddings (only useful if you plan to fine-tune) |
 | `--use-cpu-only` | Use CPU instead of GPU with float32 precision |
+| `--trust-remote-code` | Allow custom code execution when loading models with non-standard architectures |
 | `--verbose` | Show detailed token mapping output |
 
 ### Example

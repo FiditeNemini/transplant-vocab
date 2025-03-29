@@ -205,7 +205,7 @@ The `--trim-layers` option allows you to remove a range of intermediate layers f
 
 ### Important Considerations
 
-- **Performance Impact**: Unlike vocabulary transplantation (which preserves most of the model's capabilities), layer trimming significantly impacts model performance. **The resulting model will require fine-tuning** to recover acceptable performance.
+- **Performance Impact**: Unlike vocabulary transplantation (which preserves most of the model's capabilities), layer trimming significantly impacts model performance. ***The resulting model will require fine-tuning*** to recover acceptable performance.
 - **Layer Selection Strategy**: Research such as ["The Unreasonable Ineffectiveness of the Deeper Layers"](https://arxiv.org/abs/2403.17887) suggests that not all layers contribute equally to model performance.
 - **Recommended Approach**: When trimming layers, it's generally advisable to:
   - Keep the the early-middle layers (which capture lower-level patterns)

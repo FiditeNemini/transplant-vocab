@@ -155,10 +155,11 @@ def main():
     # NOTE: The config file is often wrong, so get calculate from the tokenizer instead
     actual_target_vocab_size = max(target_tokenizer.vocab.values()) + 1
 
-    # Initialize new embeddings
+    # NOTE: We need to "untie" the lm_head weights for models with tie_word_embeddings = True
     donor_embed_tokens = model.model.embed_tokens.weight
     donor_lm_head = model.model.embed_tokens.weight if donor_config.get("tie_word_embeddings", False) else model.lm_head.weight
 
+    # Initialize new embeddings
     new_embed_tokens = torch.zeros(
         (target_vocab_size, donor_config["hidden_size"]),
         dtype = donor_embed_tokens.dtype,

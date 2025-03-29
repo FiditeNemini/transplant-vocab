@@ -74,7 +74,6 @@ Processing 3 automatic token overrides:
 ✔ 'bos_token_id' : 0 '<｜begin▁of▁sentence｜>' → [151643] '<|endoftext|>'
 ✔ 'eos_token_id' : 1 '<｜end▁of▁sentence｜>' → [151645] '<|im_end|>'
 ✘ 'pad_token_id' : 1 is already mapped to [151645]
-
 ```
 
 **NOTE**: Some models (eg: `qwen`) don't use any `bos_token_id` so we try to manually patch `tokenizer_config.json` to fix this at the end.
@@ -94,7 +93,7 @@ You can specify multiple overrides by repeating the `--override` option. This is
 
 #### Example: Mapping Chat and Special Tokens
 
-Here's a real-world example of manually mapping Qwen2.5 tokens to DeepSeek-V3 tokens:
+Here's a real-world example of manually mapping `Qwen2.5` tokens to `DeepSeek-V3` tokens:
 
 ```bash
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-V3 ./DeepSeek-V3-DRAFT-0.5B \

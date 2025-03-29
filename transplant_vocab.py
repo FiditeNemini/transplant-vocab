@@ -30,7 +30,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("target_dir", help = "Path to target model directory")
     parser.add_argument("output_dir", help = "Path to output model directory")
     parser.add_argument("--override", nargs = 2, action = "append", default = [],
-                       help = "Override target token with donor token (can be used multiple times)")
+                       help = "Override target token with donor sequence (can be used multiple times)")
     parser.add_argument("--weighting-decay-factor", type = float, default = 0.5,
                        help = "Decay factor [0-1] for multi-token mappings: "
                             "0=first token only, 0.5=decreasing weights, 1=uniform mean")

@@ -84,7 +84,15 @@ Trim out intermediate layers to create a smaller model that we can use for furth
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-trimmed --trim-layers 14-21
 ```
 
-(*eg: this leaves us with a model which has 16 layer in total: 14 taken from the start and 2 from the end of the donor model*)
+and this leaves us with a model which has 16 layer in total; 14 taken from the start and 2 from the end of the donor model:
+
+```
+Trimming layers 14 through 21 (inclusive): 
+- Old layer count : 24 (layers 0-23)
+- New layer count : 16 (keeping layers 0-13 and 22-23)
+- Removed a total of 96 tensors from state_dict.
+- Updated model configuration so `num_hidden_layers = 16`.
+```
 
 ### Token Mapping
 

@@ -131,7 +131,7 @@ You can specify multiple overrides by repeating the `--override` option. This is
 
 #### Example: Mapping Chat and Special Tokens
 
-Here's a real-world example of manually mapping `Qwen2.5` tokens to `DeepSeek-V3` tokens:
+Here we manually map (target) `DeepSeek-V3` tokens to (donor) `Qwen2.5` tokens/sequences:
 
 ```bash
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-V3 ./DeepSeek-V3-DRAFT-0.5B \

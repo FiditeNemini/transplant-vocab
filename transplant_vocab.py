@@ -33,6 +33,8 @@ def parse_arguments() -> argparse.Namespace:
                        help = "Overwrite output directory if it exists")
     parser.add_argument("--unmapped-init-scale", type = float, default = 0.0,
                        help = "Scale factor [0-1] for initializing unmapped lm_head tokens")
+    parser.add_argument("--override", nargs = 2, action = "append", default = [],
+                       help = "Override target token with donor token (can be used multiple times)")
     parser.add_argument("--use-cpu-only", action = "store_true",
                        help = "Use CPU only for model loading and processing in float32")
     parser.add_argument("--trust-remote-code", action = "store_true",
@@ -124,23 +126,26 @@ def main():
     donor_config = load_model_config(args.donor_dir)
     target_config = load_model_config(args.target_dir)
 
-    # Retrieving the donor vocabulary size (for both flat and nested configurations)
+    # Get the donor vocabulary size (for both flat and nested configurations)
     if "text_config" in donor_config and "vocab_size" in donor_config["text_config"]:
         donor_vocab_size = donor_config["text_config"]["vocab_size"]
     else:
         assert "vocab_size" in donor_config, "vocab_size not found in source model config"
         donor_vocab_size = donor_config["vocab_size"]
-    print(f"Donor vocab size: {donor_vocab_size}")
 
-    # Retrieving the target vocabulary size (for both flat and nested configurations)
+    # Get the donor hidden size (for both flat and nested configurations)
+    if "text_config" in donor_config and "hidden_size" in donor_config["text_config"]:
+        donor_vocab_size = donor_config["text_config"]["hidden_size"]
+    else:
+        assert "hidden_size" in donor_config, "hidden_size not found in source model config"
+        donor_hidden_size = donor_config["hidden_size"]
+
+    # Get the target vocabulary size (for both flat and nested configurations)
     if "text_config" in target_config and "vocab_size" in target_config["text_config"]:
         target_vocab_size = target_config["text_config"]["vocab_size"]
     else:
         assert "vocab_size" in target_config, "vocab_size not found in target model config"
         target_vocab_size = target_config["vocab_size"]
-    print(f"Target vocab size: {target_vocab_size}")
-
-    assert "hidden_size" in donor_config, "hidden_size not found in donor model config"
 
     # Load tokenizers
     donor_tokenizer = load_tokenizer(args.donor_dir, args.trust_remote_code)
@@ -152,21 +157,27 @@ def main():
     else:
         model = load_model(args.donor_dir, args.trust_remote_code, donor_config.get("torch_dtype", None))
 
-    # NOTE: The config file is often wrong, so get calculate from the tokenizer instead
-    actual_target_vocab_size = max(target_tokenizer.vocab.values()) + 1
+    # The config file counts the all tokens, but we also need to know how many are used for the loop
+    used_target_vocab_size = max(target_tokenizer.vocab.values()) + 1
+    unused_target_vocab_size = target_vocab_size - used_target_vocab_size
+
+    print("\nLoaded OK:")
+    print(f"- Donor vocab size  : {donor_vocab_size}")
+    print(f"- Target vocab size : {target_vocab_size} (used = {used_target_vocab_size}, unused = {unused_target_vocab_size})")
+    print(f"- Donor hidden size : {donor_hidden_size}")
 
     # NOTE: We need to "untie" the lm_head weights for models with tie_word_embeddings = True
     donor_embed_tokens = model.model.embed_tokens.weight
     donor_lm_head = model.model.embed_tokens.weight if donor_config.get("tie_word_embeddings", False) else model.lm_head.weight
 
-    # Initialize new embeddings
+    # Initialize new embedding and head tensors with zeros
     new_embed_tokens = torch.zeros(
-        (target_vocab_size, donor_config["hidden_size"]),
+        (target_vocab_size, donor_hidden_size),
         dtype = donor_embed_tokens.dtype,
         device = donor_embed_tokens.device
     )
     new_lm_head = torch.zeros(
-        (target_vocab_size, donor_config["hidden_size"]),
+        (target_vocab_size, donor_hidden_size),
         dtype = donor_lm_head.dtype,
         device = donor_lm_head.device
     )
@@ -178,20 +189,80 @@ def main():
     lm_head_set_count = 0
     lm_head_scaled_count = 0
 
+    override_map = {}
+
+    # Process the automatic overrides
+    special_tokens = ['bos_token_id', 'eos_token_id', 'pad_token_id']
+    print(f"\nProcessing {len(special_tokens)} automatic token overrides:")
+    for token_attr in special_tokens:
+        # First try to get from the tokenizer
+        target_token_id = getattr(target_tokenizer, token_attr)
+        donor_token_id = getattr(donor_tokenizer, token_attr)
+
+        # Try to get from config if not found in tokenizer
+        if target_token_id is None and token_attr in target_config:
+            target_token_id = target_config[token_attr]
+        if donor_token_id is None and token_attr in donor_config:
+            donor_token_id = donor_config[token_attr]
+
+        # Try to perform the automatic match
+        if target_token_id is not None:
+            if donor_token_id is not None:
+                if target_token_id not in override_map:
+                    target_token = target_tokenizer.convert_ids_to_tokens(target_token_id)
+                    donor_token = donor_tokenizer.convert_ids_to_tokens(donor_token_id)
+                    override_map[target_token_id] = torch.tensor([donor_token_id], dtype = torch.long)
+                    print(f"✔ {repr(token_attr)} : {target_token_id} {repr(target_token)} → [{donor_token_id}] {repr(donor_token)}")
+                else:
+                    print(f"✘ {repr(token_attr)} : {target_token_id} is already mapped to [{override_map[target_token_id].item()}]")
+            else:
+                print(f"✘ {repr(token_attr)} : Not found for donor model");
+        else:
+            print(f"✘ {repr(token_attr)} : Not found for target model");
+
+    # Process manual token overrides
+    if args.override:
+        print(f"\nProcessing {len(args.override)} manual token overrides:")
+        for target_token, donor_tokens in args.override:
+            # Encode target token and verify it's a single token
+            target_id = target_tokenizer.encode(target_token, add_special_tokens = False)
+            assert len(target_id) == 1, f"Target token '{target_token}' maps to {len(target_id)} tokens. Must be a 1 token."
+            target_id = target_id[0]
+
+            # Replace newline characters with the actual byte representation of a newline (0x0A)
+            # NOTE: If you don't do this then it will get wrong;y encoded as the "\\n" string literal
+            if "\\n" in donor_tokens:
+                donor_tokens = donor_tokens.replace("\\n", chr(10))
+
+            # Get the IDs from the token string
+            encoded = donor_tokenizer.encode(donor_tokens, add_special_tokens = False, return_tensors = "pt").flatten()
+            assert encoded.numel() != 0, f"Donor token '{donor_tokens}' for target ID {idx} encodes to 0 tokens."
+
+            # Store the donor token IDs
+            override_map[target_id] = encoded
+
+            print(f"✔ {target_id:6d} : {repr(target_token)} → {encoded.tolist()} {repr(donor_tokens)}")
+    print()
+
     # Used to track already used prefix tokens for the lm_head
     used_prefix_tokens = set()
 
     # Configure progress display
-    iterator = range(actual_target_vocab_size)
-    if not args.verbose:
+    iterator = range(used_target_vocab_size)
+    if args.verbose:
+        print("Transplanting tokens:")
+    else:
         iterator = tqdm(iterator, desc = "Transplanting tokens", unit = "token")
 
     for idx in iterator:
         decoded = target_tokenizer.decode([idx], decode_special_tokens = True)
-        encoded = donor_tokenizer.encode(decoded, add_special_tokens = False, return_tensors = "pt").flatten()
+        if idx in override_map:
+            encoded = override_map[idx]
+        else:
+            encoded = donor_tokenizer.encode(decoded, add_special_tokens = False, return_tensors = "pt").flatten()
 
         if args.verbose:
-            print(f"{idx:5d}: {repr(decoded)} → {encoded.tolist()}")
+            print(f"- {idx:6d} : {repr(decoded)} → {encoded.tolist()}")
 
         # Track mapping types
         if encoded.numel() in mapping_counts:
@@ -218,14 +289,14 @@ def main():
     print("\nTransplant mappings:")
     for count, occurrences in sorted(mapping_counts.items()):
         mapping_label = f"{count} to 1"
-        print(f"- {mapping_label:<8}: {occurrences} ({occurrences/actual_target_vocab_size:.1%})")
+        print(f"- {mapping_label:<8}: {occurrences} ({(occurrences/used_target_vocab_size*100):.2g}%)")
 
     print("\nHead initialized with:")
     lm_head_zeroed_count = target_vocab_size - (lm_head_set_count + lm_head_scaled_count)
-    print(f"- Copies : {lm_head_set_count} ({lm_head_set_count/target_vocab_size:.1%})")
+    print(f"- Copies : {lm_head_set_count} ({(lm_head_set_count/target_vocab_size*100):.2g}%)")
     if lm_head_scaled_count > 0:
-        print(f"- Means  : {lm_head_scaled_count} ({lm_head_scaled_count/target_vocab_size:.1%})")
-    print(f"- Zeros  : {lm_head_zeroed_count} ({lm_head_zeroed_count/target_vocab_size:.1%})")
+        print(f"- Means  : {lm_head_scaled_count} ({(lm_head_scaled_count/target_vocab_size*100):.2g}%)")
+    print(f"- Zeros  : {lm_head_zeroed_count} ({(lm_head_zeroed_count/target_vocab_size*100):.2g}%)")
 
     # Make a copy of the model's state_dict and get the type
     new_state_dict = model.state_dict().copy()
@@ -246,20 +317,49 @@ def main():
         'eos_token_id': target_tokenizer.eos_token_id,
     })
 
-    # Add pad_token_id if it exists in the target tokenizer
-    if target_tokenizer.pad_token_id is not None:
-        model.config.update({'pad_token_id': target_tokenizer.pad_token_id})
+    # Update the config's pad_token_id if it exists
+    if hasattr(model.config, 'pad_token_id'):
+        if target_tokenizer.pad_token_id is not None:
+            model.config.update({'pad_token_id': target_tokenizer.pad_token_id})
+        else:
+            model.config.update({'pad_token_id': target_tokenizer.eos_token_id})  # Default to EOS if no PAD to copy
 
-    # Set tie_word_embeddings to False if it exists
+    # Set the config's tie_word_embeddings to False if it exists
     if hasattr(model.config, 'tie_word_embeddings'):
         model.config.update({'tie_word_embeddings': False})
 
     # Save final model and tokenizer
-    print(f"\nSaving model and tokenizer to {args.output_dir}")
+    print(f"\nSaving model and tokenizer to '{args.output_dir}' folder")
     model.save_pretrained(args.output_dir, state_dict = new_state_dict, safe_serialization = True)
     target_tokenizer.save_pretrained(args.output_dir)
 
-    print("Operation completed successfully")
+    # Only modify if the donor tokenizer doesn't use BOS tokens
+    if getattr(donor_tokenizer, "add_bos_token", False) or getattr(donor_tokenizer, "bos_token", None) is None:
+        tokenizer_config_path = os.path.join(args.output_dir, "tokenizer_config.json")
+        if os.path.exists(tokenizer_config_path):
+            print(f"\nPatching BOS handling in '{tokenizer_config_path}'")
+            try:
+                # Read the file as text without specifying encoding
+                with open(tokenizer_config_path, "r") as f:
+                    config_text = f.read()
+
+                # Make sure that add_bos_token is set to false
+                config_text = config_text.replace('"add_bos_token": true', '"add_bos_token": false')
+                print("- Updated 'add_bos_token' configuration.")
+
+                # Remove any use of bos_token from chat template
+                # NOTE: We can't (safely) set '"bos_token": null', but it shouldn't matter with these two patches...
+                config_text = config_text.replace("{{ bos_token }}", "").replace("{{bos_token}}", "")
+                print("- Removed all references to 'bos_token' from Jinja chat template.")
+
+                # Write the modified text back without specifying encoding
+                with open(tokenizer_config_path, "w") as f:
+                    f.write(config_text)
+            except Exception as e:
+                print(f"Warning: Failed to patch tokenizer configuration: {e}")
+
+    # TODO: Figure out why it causes a segmentation fault on exit???
+    print("\nOperation completed successfully (ignore any 'segmentation fault' that follows!!!)")
 
 if __name__ == "__main__":
     main()

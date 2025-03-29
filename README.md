@@ -7,7 +7,9 @@ This tool allows you to combine the transformer architecture and weights from a 
 ## Features
 
 - Preserve the donor model's intelligence/performance.
-- Adopt donor model to use the target model's tokenizer.
+- Adapt donor model to use the target model's tokenizer.
+- Automatic special tokens mapping between models.
+- User-specified manual token mapping overrides.
 
 ## Installation
 
@@ -25,7 +27,7 @@ pip install -r requirements.txt
 
 ### Basic Command
 ```bash
-python transplant_embeddings.py /path/to/donor_model /path/to/target_model /path/to/output_model
+python transplant_vocab.py /path/to/donor_model /path/to/target_model /path/to/output_model
 ```
 
 ### Options
@@ -34,6 +36,7 @@ python transplant_embeddings.py /path/to/donor_model /path/to/target_model /path
 |------|-------------|
 | `--overwrite` | Replace existing output directory |
 | `--unmapped-init-scale [0-1]` | Initialize unmapped output tokens with scaled mean embeddings (only useful if you plan to fine-tune) |
+| `--override TARGET DONOR` | Override target token with donor token (can be used multiple times) |
 | `--use-cpu-only` | Use CPU instead of GPU with float32 precision |
 | `--trust-remote-code` | Allow custom code execution when loading models with non-standard architectures |
 | `--verbose` | Show detailed token mapping output |
@@ -41,11 +44,125 @@ python transplant_embeddings.py /path/to/donor_model /path/to/target_model /path
 ### Example
 ```bash
 # For direct use (no fine-tuning planned)
-python transplant_embeddings.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B
+python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B
 
 # For creating a model you plan to fine-tune
-python transplant_embeddings.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B --unmapped-init-scale 0.1
+python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B --unmapped-init-scale 1.0
+
+# With manual token overrides for chat templates (see below)
+python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B \
+	--override "<｜User｜>" "<|im_start|>user\\n"
+	--override "<｜Assistant｜>" "<|im_start|>assistant\\n"
+	--override ...
 ```
+
+### Token Mapping
+
+#### Automatic Special Token Mapping
+
+The tool automatically attempts to map three special tokens between models:
+- `bos_token_id` (Beginning of Sequence)
+- `eos_token_id` (End of Sequence)
+- `pad_token_id` (Padding)
+
+These mappings ensure that the transplanted model correctly handles sequence boundaries and padding, which is critical for proper functioning.
+
+**NOTE**: Some models reuse `eos_token_id` as `pad_token_id` so this automatic process is not possible in these cases, eg:
+
+```
+Processing 3 automatic token overrides:
+✔ 'bos_token_id' : 0 '<｜begin▁of▁sentence｜>' → [151643] '<|endoftext|>'
+✔ 'eos_token_id' : 1 '<｜end▁of▁sentence｜>' → [151645] '<|im_end|>'
+✘ 'pad_token_id' : 1 is already mapped to [151645]
+
+```
+
+**NOTE**: Some models (eg: `qwen`) don't use any `bos_token_id` so we try to manually patch `tokenizer_config.json` to fix this at the end.
+
+#### Manual Token Mapping Overrides
+
+For more complex models, especially those with chat templates or special tokens for specific tasks, you can manually map tokens using the `--override` option:
+
+```bash
+python transplant_vocab.py ./donor_model ./target_model ./output_model --override "<target_token>" "<donor_sequence>"
+```
+
+You can specify multiple overrides by repeating the `--override` option. This is particularly useful for:
+- Chat template tokens (user/assistant markers)
+- Special task tokens (FIM, tool calls, etc.)
+- Any token that needs specific handling
+
+#### Example: Mapping Chat and Special Tokens
+
+Here's a real-world example of manually mapping Qwen2.5 tokens to DeepSeek-V3 tokens:
+
+```bash
+python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-V3 ./DeepSeek-V3-DRAFT-0.5B \
+	--override "<｜▁pad▁｜>" "<|endoftext|>" \
+	--override "<｜fim▁hole｜>" "<|fim_middle|>" \
+	--override "<｜fim▁begin｜>" "<|fim_prefix|>" \
+	--override "<｜fim▁end｜>" "<|fim_suffix|>" \
+	--override "<｜User｜>" "<|im_start|>user\n" \
+	--override "<｜Assistant｜>" "<|im_start|>assistant\n" \
+	--override "<|EOT|>" "<|endoftext|>" \
+	--override "<｜tool▁calls▁begin｜>" "<tool_call>" \
+	--override "<｜tool▁call▁begin｜>" "<tool_call>" \
+	--override "<｜tool▁outputs▁begin｜>" "<tool_call>" \
+	--override "<｜tool▁output▁begin｜>" "<tool_call>" \
+	--override "<｜tool▁calls▁end｜>" "</tool_call>" \
+	--override "<｜tool▁call▁end｜>" "</tool_call>" \
+	--override "<｜tool▁outputs▁end｜>" "</tool_call>" \
+	--override "<｜tool▁output▁end｜>" "</tool_call>" \
+	--override "<｜tool▁sep｜>" "</tool_call>"
+```
+
+which should output something like this:
+
+```
+Processing 16 manual token overrides:
+✔      2 : '<｜▁pad▁｜>' → [151643] '<|endoftext|>'
+✔ 128800 : '<｜fim▁hole｜>' → [151660] '<|fim_middle|>'
+✔ 128801 : '<｜fim▁begin｜>' → [151659] '<|fim_prefix|>'
+✔ 128802 : '<｜fim▁end｜>' → [151661] '<|fim_suffix|>'
+✔ 128803 : '<｜User｜>' → [151644, 872, 198] '<|im_start|>user\n'
+✔ 128804 : '<｜Assistant｜>' → [151644, 77091, 198] '<|im_start|>assistant\n'
+✔ 128805 : '<|EOT|>' → [151643] '<|endoftext|>'
+✔ 128806 : '<｜tool▁calls▁begin｜>' → [151657] '<tool_call>'
+✔ 128808 : '<｜tool▁call▁begin｜>' → [151657] '<tool_call>'
+✔ 128810 : '<｜tool▁outputs▁begin｜>' → [151657] '<tool_call>'
+✔ 128812 : '<｜tool▁output▁begin｜>' → [151657] '<tool_call>'
+✔ 128807 : '<｜tool▁calls▁end｜>' → [151658] '</tool_call>'
+✔ 128809 : '<｜tool▁call▁end｜>' → [151658] '</tool_call>'
+✔ 128811 : '<｜tool▁outputs▁end｜>' → [151658] '</tool_call>'
+✔ 128813 : '<｜tool▁output▁end｜>' → [151658] '</tool_call>'
+✔ 128814 : '<｜tool▁sep｜>' → [151658] '</tool_call>'
+```
+
+**NOTE**: I suggest you use the `--verbose` flag to verify your mappings are working as expected, eg:
+
+```
+Transplanting tokens:
+-      0 : '<｜begin▁of▁sentence｜>' → [151643]
+-      1 : '<｜end▁of▁sentence｜>' → [151645]
+-      2 : '<｜▁pad▁｜>' → [151643]
+- 128800 : '<｜fim▁hole｜>' → [151660]
+- 128801 : '<｜fim▁begin｜>' → [151659]
+- 128802 : '<｜fim▁end｜>' → [151661]
+- 128803 : '<｜User｜>' → [151644, 872, 198]
+- 128804 : '<｜Assistant｜>' → [151644, 77091, 198]
+- 128805 : '<|EOT|>' → [151643]
+- 128806 : '<｜tool▁calls▁begin｜>' → [151657]
+- 128807 : '<｜tool▁calls▁end｜>' → [151658]
+- 128808 : '<｜tool▁call▁begin｜>' → [151657]
+- 128809 : '<｜tool▁call▁end｜>' → [151658]
+- 128810 : '<｜tool▁outputs▁begin｜>' → [151657]
+- 128811 : '<｜tool▁outputs▁end｜>' → [151658]
+- 128812 : '<｜tool▁output▁begin｜>' → [151657]
+- 128813 : '<｜tool▁output▁end｜>' → [151658]
+- 128814 : '<｜tool▁sep｜>' → [151658]
+```
+
+and also to explore other possible manual overrides...
 
 ## Design Rationale
 

@@ -218,7 +218,7 @@ We use **D** (**MOSTLY** the first token) because:
 - Using means or scaling logits isn't mathematically ideal for probability distribution.
 - Proper token splitting would require subtracting `log(n)` from each token in an n-token group.
 - In the absence of an `lm_head.bias`, our approach provides the most practical solution.
-- The `--weighting-decay-factor` parameter controls how we handle cases where one target token maps to multiple donor tokens. The default value of `0.5` balances between preserving the importance of the first token while still incorporating information from all tokens in the sequence. Values closer to `1.0` may provide better initialization for fine-tuning but could produce less reliable outputs if used without any further fine-tuning.
+- The `--weighting-decay-factor` parameter controls how we handle cases where one target token maps to multiple donor tokens. The default value of `0.5` balances between preserving the importance of the first token while still incorporating information from all tokens in the sequence. Values closer to `0.0` or `1.0` may provide better initialisations for fine-tuning but could produce less reliable outputs if used without any further fine-tuning.
 
 ## Credit
 

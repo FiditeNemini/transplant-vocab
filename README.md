@@ -35,7 +35,7 @@ python transplant_vocab.py /path/to/donor_model /path/to/target_model /path/to/o
 
 | Flag | Description |
 |------|-------------|
-| `--override TARGET DONOR` | Override target token with donor token (can be used multiple times) |
+| `--override TARGET DONOR` | Override target token with donor sequence (can be used multiple times) |
 | `--weighting-decay-factor [0-1]` | Decay factor for multi-token mappings: 0=first token only, 0.5=decreasing weights, 1=uniform mean |
 | `--trim-layers START-END` | Trim out a range of layers from the model: start-end (inclusive) |
 | `--use-cpu-only` | Use CPU instead of GPU (and with `float32` precision) |

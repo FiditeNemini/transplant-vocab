@@ -34,26 +34,46 @@ python transplant_vocab.py /path/to/donor_model /path/to/target_model /path/to/o
 
 | Flag | Description |
 |------|-------------|
-| `--overwrite` | Replace existing output directory |
-| `--unmapped-init-scale [0-1]` | Initialize unmapped output tokens with scaled mean embeddings (only useful if you plan to fine-tune) |
 | `--override TARGET DONOR` | Override target token with donor token (can be used multiple times) |
-| `--use-cpu-only` | Use CPU instead of GPU with float32 precision |
+| `--weighting-decay-factor [0-1]` | Decay factor for multi-token mappings: 0=first token only, 0.5=decreasing weights, 1=uniform mean |
+| `--use-cpu-only` | Use CPU instead of GPU (and with `float32` precision) |
 | `--trust-remote-code` | Allow custom code execution when loading models with non-standard architectures |
+| `--overwrite` | Replace existing output directory |
 | `--verbose` | Show detailed token mapping output |
 
-### Example
+### Examples
+
+To transplant `DeepSeek-R1` tokenizer into `Qwen2.5-0.5B-Instruct` model and output as new model called `DeepSeek-R1-DRAFT-0.5B`:
+
 ```bash
-# For direct use (no fine-tuning planned)
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B
+```
 
-# For creating a model you plan to fine-tune
-python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B --unmapped-init-scale 1.0
+With manual token mapping overrides for chat templates (see below for detailed explanation):
 
-# With manual token overrides for chat templates (see below)
+```bash
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B \
 	--override "<｜User｜>" "<|im_start|>user\\n" \
 	--override "<｜Assistant｜>" "<|im_start|>assistant\\n" \
 	--override ...
+```
+
+Use only first token for `lm_head` averaging (maximum front-loading):
+
+```bash
+python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-first --weighting-decay-factor 0.0
+```
+
+Use uniform mean for `lm_head` averaging (ie: equal weight to all tokens):
+
+```bash
+python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-mean --weighting-decay-factor 1.0
+```
+
+Use decreasing weights (eg: 1, 0.5, 0.25, etc.) for `lm_head` averaging (default behaviour):
+
+```bash
+python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-decay --weighting-decay-factor 0.5
 ```
 
 ### Token Mapping
@@ -170,40 +190,35 @@ When a target token maps to multiple donor tokens:
 ```text
 Target: [X] → Donor: [A, B, C]
 ```
-We use **C** (the final token) because:
+We use **C** (**ONLY** the final token) because:
 
 1. Transformers process tokens sequentially, with transformer blocks "looking backward".
 2. It's the transformer blocks that integrate context from previous tokens.
 3. Taking the mean of all tokens doesn't align with how transformers process sequences.
 4. Using the final token aligns with how the transformers process the previous token to create the next token.
 
-### Output Head (First Token Uniqueness)
+### Output Head (First Token Strategy)
 When a target token maps to multiple donor tokens:
 ```text
 Target: [Y] → Donor: [D, E, F]
 ```
-We use **D** (the first token) because:
+We use **D** (**MOSTLY** the first token) because:
 
 1. The model decides on word endings in subsequent autoregressive passes.
-2. Using mean embeddings would inappropriately include information about future word endings.
-3. We track which first tokens have been used to avoid probability mass inflation.
-4. When a first token is already used, we have two options:
-   - Initialize to zero (default, best for direct use without fine-tuning).
-   - Use a scaled mean of all token embeddings (with `--unmapped-init-scale`, only useful as a better starting point for fine-tuning).
+2. When handling multi-token mappings, we have three options:
+   - Use only the first token (`--weighting-decay-factor 0.0`)
+   - Use a uniform mean of all tokens (`--weighting-decay-factor 1.0`)
+   - Use exponentially decreasing weights (`--weighting-decay-factor 0.5`)
+3. We choose to use `0.5` as the default because:
+   - Using only the first token creates probability mass inflation for repeated prefixes.
+   - Using a uniform mean inappropriately gives too much weight to trailing tokens.
 
 ### Mathematical Considerations
 
 - Using means or scaling logits isn't mathematically ideal for probability distribution.
 - Proper token splitting would require subtracting `log(n)` from each token in an n-token group.
 - In the absence of an `lm_head.bias`, our approach provides the most practical solution.
-- The `--unmapped-init-scale` option should only be used if you plan to fine-tune the model afterward, as it provides a better initialization point for training but may produce unreliable outputs if used directly.
-
-## Technical Notes
-
-- **CPU Option**: For systems without GPU or for models too large for your GPU (note: this will load/save as `float32`).
-- **Multi-Token Mappings**: Statistics showing distribution of mapping types.
-- **Output Head Initialization**: Shows percentage of tokens initialized with different strategies.
-- **Fine-tuning Preparation**: Use `--unmapped-init-scale` when creating models for further training, leave at default 0.0 for direct use.
+- The `--weighting-decay-factor` parameter controls how we handle cases where one target token maps to multiple donor tokens. The default value of `0.5` balances between preserving the importance of the first token while still incorporating information from all tokens in the sequence. Values closer to `1.0` may provide better initialization for fine-tuning but could produce less reliable outputs if used without any further fine-tuning.
 
 ## Credit
 

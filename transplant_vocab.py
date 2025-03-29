@@ -29,23 +29,24 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("donor_dir", help = "Path to donor model directory")
     parser.add_argument("target_dir", help = "Path to target model directory")
     parser.add_argument("output_dir", help = "Path to output model directory")
-    parser.add_argument("--overwrite", action = "store_true",
-                       help = "Overwrite output directory if it exists")
-    parser.add_argument("--unmapped-init-scale", type = float, default = 0.0,
-                       help = "Scale factor [0-1] for initializing unmapped lm_head tokens")
     parser.add_argument("--override", nargs = 2, action = "append", default = [],
                        help = "Override target token with donor token (can be used multiple times)")
+    parser.add_argument("--weighting-decay-factor", type = float, default = 0.5,
+                       help = "Decay factor [0-1] for multi-token mappings: "
+                            "0=first token only, 0.5=decreasing weights, 1=uniform mean")
     parser.add_argument("--use-cpu-only", action = "store_true",
                        help = "Use CPU only for model loading and processing in float32")
     parser.add_argument("--trust-remote-code", action = "store_true",
                        help = "Allow custom code execution when loading models with non-standard architectures")
+    parser.add_argument("--overwrite", action = "store_true",
+                       help = "Overwrite output directory if it exists")
     parser.add_argument("--verbose", action = "store_true",
                        help = "Show detailed token mapping output")
 
     args = parser.parse_args()
 
-    if not (0.0 <= args.unmapped_init_scale <= 1.0):
-        sys.exit(f"Error: --unmapped-init-scale must be between 0.0 and 1.0 (got {args.unmapped_init_scale})")
+    if not (0.0 <= args.weighting_decay_factor <= 1.0):
+        sys.exit(f"Error: --weighting-decay-factor must be between 0.0 and 1.0 (got {args.weighting_decay_factor})")
 
     return args
 
@@ -118,6 +119,39 @@ def load_model(path: str, trust_remote_code = False, torch_dtype = None) -> Auto
     except Exception as e:
         sys.exit(f"Failed to load model: {e}")
 
+def compute_front_loaded_mean(v, weighting_decay_factor = 0.5):
+    """
+    Computes the "front-loaded" exponentially-weighted mean with a weighting decay factor.
+    
+    Parameters:
+    - v: torch tensor with values
+    - weighting_decay_factor: parameter in [0, 1] controlling how quickly weights decay for subsequent vectors
+    
+    Returns:
+    - Weighted average tensor
+    
+    Special cases:
+    - weighting_decay_factor=0   : Returns only the first vector (maximum front-loading)
+    - weighting_decay_factor=0.5 : Applies weights 1, 0.5, 0.25, 0.125, ... (earlier vectors have more influence)
+    - weighting_decay_factor=1   : Returns the uniform arithmetic mean (no front-loading)
+    """
+    # Assert that weighting_decay_factor is in the valid range [0, 1]
+    assert 0 <= weighting_decay_factor <= 1, f"weighting_decay_factor must be in range [0, 1], got {weighting_decay_factor}"
+
+    n = v.shape[0]
+
+    if n == 1 or weighting_decay_factor == 0:
+        return v[0]  # First (or only) vector only
+    elif weighting_decay_factor == 1:
+        return torch.mean(v, dim = 0)  # Arithmetic mean
+    else:
+        # Compute the weights using geometric progression
+        decay_powers = torch.tensor([weighting_decay_factor ** i for i in range(n)], device = v.device)
+        decay_powers = decay_powers.view(-1, *([1] * (v.dim() - 1)))
+        weighted_sum = torch.sum(decay_powers * v, dim = 0)
+        denominator = torch.sum(decay_powers)
+        return weighted_sum / denominator
+
 def main():
     args = parse_arguments()
     validate_directories(args)
@@ -166,29 +200,7 @@ def main():
     print(f"- Target vocab size : {target_vocab_size} (used = {used_target_vocab_size}, unused = {unused_target_vocab_size})")
     print(f"- Donor hidden size : {donor_hidden_size}")
 
-    # NOTE: We need to "untie" the lm_head weights for models with tie_word_embeddings = True
-    donor_embed_tokens = model.model.embed_tokens.weight
-    donor_lm_head = model.model.embed_tokens.weight if donor_config.get("tie_word_embeddings", False) else model.lm_head.weight
-
-    # Initialize new embedding and head tensors with zeros
-    new_embed_tokens = torch.zeros(
-        (target_vocab_size, donor_hidden_size),
-        dtype = donor_embed_tokens.dtype,
-        device = donor_embed_tokens.device
-    )
-    new_lm_head = torch.zeros(
-        (target_vocab_size, donor_hidden_size),
-        dtype = donor_lm_head.dtype,
-        device = donor_lm_head.device
-    )
-
-    # Track mapping statistics
-    mapping_counts = {}
-
-    # Track lm_head statistics
-    lm_head_set_count = 0
-    lm_head_scaled_count = 0
-
+    # Automatic and manual overrides
     override_map = {}
 
     # Process the automatic overrides
@@ -244,8 +256,28 @@ def main():
             print(f"✔ {target_id:6d} : {repr(target_token)} → {encoded.tolist()} {repr(donor_tokens)}")
     print()
 
-    # Used to track already used prefix tokens for the lm_head
-    used_prefix_tokens = set()
+    # NOTE: We need to "untie" the lm_head weights for models with tie_word_embeddings = True
+    donor_embed_tokens = model.model.embed_tokens.weight
+    donor_lm_head = model.model.embed_tokens.weight if donor_config.get("tie_word_embeddings", False) else model.lm_head.weight
+
+    # Initialize new embedding and head tensors with zeros
+    new_embed_tokens = torch.zeros(
+        (target_vocab_size, donor_hidden_size),
+        dtype = donor_embed_tokens.dtype,
+        device = donor_embed_tokens.device
+    )
+    new_lm_head = torch.zeros(
+        (target_vocab_size, donor_hidden_size),
+        dtype = donor_lm_head.dtype,
+        device = donor_lm_head.device
+    )
+
+    # Track mapping statistics
+    mapping_counts = {}
+
+    # Track lm_head statistics
+    lm_head_copy_count = 0
+    lm_head_mean_count = 0
 
     # Configure progress display
     iterator = range(used_target_vocab_size)
@@ -273,17 +305,14 @@ def main():
         # Use only the final token of encoded sequence for input embeddings
         new_embed_tokens[idx] = donor_embed_tokens[encoded[-1]]
 
-        # Use only the first token for head embeddings (unless asked to use scaled mean)
-        prefix_token = encoded[0].item()
-        if prefix_token not in used_prefix_tokens:
-            used_prefix_tokens.add(prefix_token)
-            new_lm_head[idx] = donor_lm_head[prefix_token]
-            lm_head_set_count += 1
-        elif args.unmapped_init_scale > 0:
-            encode_tokens = encoded.flatten()
-            head_embeddings = donor_lm_head[encode_tokens]
-            new_lm_head[idx] = head_embeddings.mean(dim = 0) * args.unmapped_init_scale
-            lm_head_scaled_count += 1
+        # Use a "front-loaded" exponentially-weighted mean for lm_head embeddings
+        if encoded.numel() == 1:
+            new_lm_head[idx] = donor_lm_head[encoded[0].item()]
+            lm_head_copy_count += 1
+        else:
+            head_embeddings = donor_lm_head[encoded.flatten()]
+            new_lm_head[idx] = compute_front_loaded_mean(head_embeddings, args.weighting_decay_factor)
+            lm_head_mean_count += 1
 
     # Print statistics
     print("\nTransplant mappings:")
@@ -292,10 +321,9 @@ def main():
         print(f"- {mapping_label:<8}: {occurrences} ({(occurrences/used_target_vocab_size*100):.2g}%)")
 
     print("\nHead initialized with:")
-    lm_head_zeroed_count = target_vocab_size - (lm_head_set_count + lm_head_scaled_count)
-    print(f"- Copies : {lm_head_set_count} ({(lm_head_set_count/target_vocab_size*100):.2g}%)")
-    if lm_head_scaled_count > 0:
-        print(f"- Means  : {lm_head_scaled_count} ({(lm_head_scaled_count/target_vocab_size*100):.2g}%)")
+    lm_head_zeroed_count = target_vocab_size - (lm_head_copy_count + lm_head_mean_count)
+    print(f"- Copies : {lm_head_copy_count} ({(lm_head_copy_count/target_vocab_size*100):.2g}%)")
+    print(f"- Means  : {lm_head_mean_count} ({(lm_head_mean_count/target_vocab_size*100):.2g}%)")
     print(f"- Zeros  : {lm_head_zeroed_count} ({(lm_head_zeroed_count/target_vocab_size*100):.2g}%)")
 
     # Make a copy of the model's state_dict and get the type

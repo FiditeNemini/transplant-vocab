@@ -43,7 +43,7 @@ def parse_arguments() -> argparse.Namespace:
                        help = "Use CPU only for model loading and processing in float32")
     parser.add_argument("--trust-remote-code", action = "store_true",
                        help = "Allow custom code execution when loading models with non-standard architectures")
-    parser.add_argument("--patch-missing-eos", action = "store_true",
+    parser.add_argument("--patch-missing-bos", action = "store_true",
                        help = "Patch `tokenizer_config.json` for models like `Qwen` which don't use any `<BOS>` token")
     parser.add_argument("--overwrite", action = "store_true",
                        help = "Overwrite output directory if it exists")
@@ -630,7 +630,7 @@ def main():
     target_tokenizer.save_pretrained(args.output_dir)
 
     # Finally, attempt to patch the EOS stuff if the donor tokenizer doesn't use BOS tokens
-    if args.patch_missing_eos and (getattr(donor_tokenizer, "add_bos_token", False)
+    if args.patch_missing_bos and (getattr(donor_tokenizer, "add_bos_token", False)
                                    or getattr(donor_tokenizer, "bos_token", None) is None):
         tokenizer_config_path = os.path.join(args.output_dir, "tokenizer_config.json")
         if os.path.exists(tokenizer_config_path):

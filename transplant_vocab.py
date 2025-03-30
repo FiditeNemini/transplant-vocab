@@ -37,6 +37,8 @@ def parse_arguments() -> argparse.Namespace:
                             "0=first token only, 0.5=decreasing weights, 1=uniform mean")
     parser.add_argument("--trim-layers", type = str,
                        help = "Trim out a range of layers from the model: start-end (inclusive)")
+    parser.add_argument("--trim-intermediate-size", type = int,
+                       help = "Trim the hidden state dimension of the MLP blocks")
     parser.add_argument("--use-cpu-only", action = "store_true",
                        help = "Use CPU only for model loading and processing in float32")
     parser.add_argument("--trust-remote-code", action = "store_true",
@@ -259,6 +261,139 @@ def trim_model_layers(model, state_dict, start_layer, end_layer):
 
     return model, new_state_dict
 
+def trim_model_intermediate_size(model, state_dict, new_size):
+    """
+    Trim the hidden state dimension of the MLP blocks.
+    
+    Args:
+        model: The model to modify
+        state_dict: The state dictionary to modify
+        new_intermediate_size: The new hidden state dimension to use
+    
+    Returns:
+        Tuple of (modified model, modified state_dict)
+    """
+    # Get the current intermediate_size from the model config
+    old_size = model.config.intermediate_size
+
+    assert new_size < old_size, f"New intermediate size ({new_size}) must be smaller than old ({old_size})"
+
+    print(f"\nTrimming intermediate size from {old_size} to {new_size}: ")
+
+    # Create a new state dict with trimmed tensors
+    new_state_dict = {}
+    trimmed_count = 0
+
+    # Update the model's configuration
+    model.config.intermediate_size = new_size
+
+    # Also update nested configurations if present (for models like Gemma, Llama, etc.)
+    if hasattr(model.config, 'text_config') and hasattr(model.config.text_config, 'intermediate_size'):
+        model.config.text_config.intermediate_size = new_size
+
+    # Process each tensor in the state dict
+    for key, tensor in state_dict.items():
+        # Check if this tensor has a dimension matching the hidden size
+        if any(dim == old_size for dim in tensor.shape):
+            # Create a new tensor with the appropriate dimensions
+            new_shape = list(tensor.shape)
+            for i, dim in enumerate(new_shape):
+                if dim == old_size:
+                    new_shape[i] = new_size
+
+            # Create a completely new tensor with the new shape
+            if len(new_shape) == 1:
+                new_tensor = torch.zeros(
+                    new_shape[0],
+                    dtype = tensor.dtype,
+                    device = tensor.device
+                )
+                # Copy data from the original tensor
+                new_tensor[:] = tensor[:new_size]
+            elif len(new_shape) == 2:
+                new_tensor = torch.zeros(
+                    new_shape[0], new_shape[1],
+                    dtype = tensor.dtype,
+                    device = tensor.device
+                )
+                # Copy data based on which dimensions need trimming
+                if tensor.shape[0] == old_size and tensor.shape[1] == old_size:
+                    new_tensor[:,:] = tensor[:new_size,:new_size]
+                elif tensor.shape[0] == old_size:
+                    new_tensor[:,:] = tensor[:new_size,:]
+                else:
+                    new_tensor[:,:] = tensor[:,:new_size]
+            else:
+                # For higher dimensional tensors
+                new_tensor = torch.zeros(
+                    new_shape,
+                    dtype = tensor.dtype,
+                    device = tensor.device
+                )
+                # Create slices for copying
+                src_slices = tuple(slice(0, new_shape[i]) if tensor.shape[i] == old_size else slice(None)
+                                  for i in range(len(tensor.shape)))
+                dst_slices = tuple(slice(None) for _ in range(len(tensor.shape)))
+                new_tensor[dst_slices] = tensor[src_slices]
+
+            new_state_dict[key] = new_tensor
+            trimmed_count += 1
+        else:
+            # Keep tensors that don't have hidden size dimensions unchanged
+            new_state_dict[key] = tensor.clone()
+
+    print(f"- Old intermediate size : {old_size}")
+    print(f"- New intermediate size : {new_size}")
+    print(f"- Trimmed {trimmed_count} tensors in state_dict")
+    print(f"- Updated model configuration so `intermediate_size = {new_size}`")
+
+    return model, new_state_dict
+
+def debug_model_tensors(model, state_dict):
+    """
+    Print detailed information about model parameters and state dict tensors
+    to help debug shape mismatches.
+    
+    Args:
+        model: The model to inspect
+        state_dict: The state dictionary to inspect
+    """
+    print("\n=== MODEL PARAMETERS ===")
+    for name, param in model.named_parameters():
+        print(f"{name}: shape={param.shape}, dtype={param.dtype}")
+
+    print("\n=== STATE DICT TENSORS ===")
+    for key, tensor in state_dict.items():
+        print(f"{key}: shape={tensor.shape}, dtype={tensor.dtype}")
+
+    print("\n=== SHAPE MISMATCHES ===")
+    mismatches = []
+    for name, param in model.named_parameters():
+        if name in state_dict and param.shape != state_dict[name].shape:
+            mismatches.append((name, param.shape, state_dict[name].shape))
+
+    if mismatches:
+        print("Found shape mismatches between model parameters and state dict:")
+        for name, model_shape, dict_shape in mismatches:
+            print(f"- {name}: model={model_shape}, state_dict={dict_shape}")
+    else:
+        print("No shape mismatches found between model parameters and state dict.")
+
+    # Check for tensors in state_dict that don't exist in model
+    model_params = {name for name, _ in model.named_parameters()}
+    extra_tensors = {key for key in state_dict if key not in model_params}
+    if extra_tensors:
+        print("\n=== EXTRA TENSORS IN STATE DICT ===")
+        for key in extra_tensors:
+            print(f"{key}: shape={state_dict[key].shape}")
+
+    # Check for parameters in model that don't exist in state_dict
+    missing_tensors = {name for name, _ in model.named_parameters() if name not in state_dict}
+    if missing_tensors:
+        print("\n=== MISSING TENSORS IN STATE DICT ===")
+        for name in missing_tensors:
+            print(name)
+
 def main():
     args = parse_arguments()
     validate_directories(args)
@@ -276,10 +411,17 @@ def main():
 
     # Get the donor hidden size (for both flat and nested configurations)
     if "text_config" in donor_config and "hidden_size" in donor_config["text_config"]:
-        donor_vocab_size = donor_config["text_config"]["hidden_size"]
+        donor_hidden_size = donor_config["text_config"]["hidden_size"]
     else:
         assert "hidden_size" in donor_config, "hidden_size not found in source model config"
         donor_hidden_size = donor_config["hidden_size"]
+
+    # Get the intermediate hidden size (for both flat and nested configurations)
+    if "text_config" in donor_config and "intermediate_size" in donor_config["text_config"]:
+        donor_intermediate_size = donor_config["text_config"]["intermediate_size"]
+    else:
+        assert "intermediate_size" in donor_config, "intermediate_size not found in source model config"
+        donor_intermediate_size = donor_config["intermediate_size"]
 
     # Get the target vocabulary size (for both flat and nested configurations)
     if "text_config" in target_config and "vocab_size" in target_config["text_config"]:
@@ -303,9 +445,10 @@ def main():
     unused_target_vocab_size = target_vocab_size - used_target_vocab_size
 
     print("\nLoaded OK:")
-    print(f"- Donor vocab size  : {donor_vocab_size}")
-    print(f"- Target vocab size : {target_vocab_size} (used = {used_target_vocab_size}, unused = {unused_target_vocab_size})")
-    print(f"- Donor hidden size : {donor_hidden_size}")
+    print(f"- Donor vocabulary size   : {donor_vocab_size}")
+    print(f"- Donor hidden size       : {donor_hidden_size}")
+    print(f"- Donor intermediate size : {donor_intermediate_size} (ratio = 1:{donor_intermediate_size/donor_hidden_size:.1f})")
+    print(f"- Target vocabulary size  : {target_vocab_size} (used = {used_target_vocab_size}, unused = {unused_target_vocab_size})")
 
     # Automatic and manual overrides
     override_map = {}
@@ -446,6 +589,10 @@ def main():
         start_layer, end_layer = map(int, args.trim_layers.split('-'))
         model, new_state_dict = trim_model_layers(model, new_state_dict, start_layer, end_layer)
 
+    # Trim intermediate size if requested
+    if args.trim_intermediate_size:
+        model, new_state_dict = trim_model_intermediate_size(model, new_state_dict, args.trim_intermediate_size)
+
     # Update model architecture
     model.model.embed_tokens.num_embeddings = target_vocab_size
     model.lm_head.out_features = target_vocab_size
@@ -467,6 +614,13 @@ def main():
     # Set the config's tie_word_embeddings to False if it exists
     if hasattr(model.config, 'tie_word_embeddings'):
         model.config.update({'tie_word_embeddings': False})
+
+    # Re-initialize the model with the updated configuration and load into it the new state dict
+    # NOTE: This seems to be more robust that just altering the model and state dict parameters
+    model = type(model)(model.config)
+    model.load_state_dict(new_state_dict)
+
+    # debug_model_tensors(model, new_state_dict)
 
     # Save final model and tokenizer
     print(f"\nSaving model and tokenizer to '{args.output_dir}' folder")

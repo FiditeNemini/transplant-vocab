@@ -46,7 +46,7 @@ python transplant_vocab.py /path/to/donor_model /path/to/target_model /path/to/o
 | `--overwrite` | Replace existing output directory |
 | `--verbose` | Show detailed token mapping output |
 
-**NOTE**: Some models like `Qwen` don't use any `<BOS>` type token, so you can try to use the experimental option `--patch-missing-eos` to manually patch `tokenizer_config.json` to fix this. This may or may not be a good idea, depending on the backend you ultimately want to use the speculative model with...
+**NOTE**: Some models like `Qwen` don't use any `<BOS>` type token, so you can try to use the experimental option `--patch-missing-eos` to manually patch `tokenizer_config.json` to fix this. This may or may not be a good idea; depending on the backend you ultimately want to use the speculative model with and/or if you intend to fine-tune the model afterwards.
 
 ### Examples
 

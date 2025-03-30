@@ -10,6 +10,7 @@ https://huggingface.co/turboderp/Qwama-0.5B-Instruct/blob/main/vocab_transplant.
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 from typing import Tuple, Dict
@@ -199,32 +200,42 @@ def trim_model_layers(model, state_dict, start_layer, end_layer):
     # Create a new state dict with trimmed layers
     new_state_dict = {}
     removed_keys = []
+    renamed_keys = []
 
-    for key, tensor in state_dict.items():
-        # Check if this key corresponds to a layer that should be removed
+    # First pass: identify all keys to process
+    all_keys = list(state_dict.keys())
+
+    layer_patterns = [r'model\.layers\.(\d+)\.', r'transformer\.h\.(\d+)\.', r'model\.decoder\.layers\.(\d+)\.']
+
+    for key in all_keys:
+        # Check if this key corresponds to a layer
         layer_match = None
-
-        # Match patterns like 'model.layers.5.self_attn.q_proj.weight'
-        import re
-        for pattern in [r'model\.layers\.(\d+)\.', r'transformer\.h\.(\d+)\.', r'model\.decoder\.layers\.(\d+)\.']:
+        for pattern in layer_patterns:
             match = re.search(pattern, key)
             if match:
                 layer_idx = int(match.group(1))
                 if start_layer <= layer_idx <= end_layer:
+                    # This layer should be removed
                     removed_keys.append(key)
-                    layer_match = match
-                    break
                 else:
                     # This layer is kept, but we need to renumber it
                     new_layer_idx = layer_mapping[layer_idx]
-                    new_key = key.replace(match.group(0), match.group(0).replace(str(layer_idx), str(new_layer_idx)))
+                    prefix = match.group(0)  # e.g., "model.layers.22."
+                    new_prefix = prefix.replace(f"{layer_idx}", f"{new_layer_idx}")
+                    new_key = key.replace(prefix, new_prefix)
+
+                    # Add to renamed keys list
+                    renamed_keys.append((key, new_key))
+
                     # Create a new tensor to avoid shared memory issues
-                    new_state_dict[new_key] = tensor.clone()
-                    break
+                    new_state_dict[new_key] = state_dict[key].clone()
+
+                # We found a match, so no need to check other patterns
+                break
 
         # If no layer match was found, keep the tensor as is
-        if layer_match is None:
-            new_state_dict[key] = tensor.clone()
+        if layer_match is None and key not in removed_keys and not any(key == old_key for old_key, _ in renamed_keys):
+            new_state_dict[key] = state_dict[key].clone()
 
     # Update the model configuration
     model.config.num_hidden_layers = new_layer_count
@@ -242,8 +253,9 @@ def trim_model_layers(model, state_dict, start_layer, end_layer):
                 new_layers.append(layer)
         model.model.layers = new_layers
 
-    print(f"- Removed a total of {len(removed_keys)} tensors from state_dict.")
-    print(f"- Updated model configuration so `num_hidden_layers = {new_layer_count}`.")
+    print(f"- Removed {len(removed_keys)} tensors from state_dict")
+    print(f"- Renamed {len(renamed_keys)} layer tensors to new indices")
+    print(f"- Updated model configuration so `num_hidden_layers = {new_layer_count}`")
 
     return model, new_state_dict
 

@@ -630,8 +630,8 @@ def main():
     target_tokenizer.save_pretrained(args.output_dir)
 
     # Finally, attempt to patch the EOS stuff if the donor tokenizer doesn't use BOS tokens
-    if arg.patch_missing_eos and (getattr(donor_tokenizer, "add_bos_token", False)
-                                  or getattr(donor_tokenizer, "bos_token", None) is None):
+    if args.patch_missing_eos and (getattr(donor_tokenizer, "add_bos_token", False)
+                                   or getattr(donor_tokenizer, "bos_token", None) is None):
         tokenizer_config_path = os.path.join(args.output_dir, "tokenizer_config.json")
         if os.path.exists(tokenizer_config_path):
             print(f"\nPatching BOS handling in '{tokenizer_config_path}'")

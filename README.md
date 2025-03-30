@@ -42,11 +42,11 @@ python transplant_vocab.py /path/to/donor_model /path/to/target_model /path/to/o
 | `--trim-intermediate-size SIZE` | Trim the hidden state dimension of the MLP blocks |
 | `--use-cpu-only` | Use CPU instead of GPU (and with `float32` precision) |
 | `--trust-remote-code` | Allow custom code execution when loading models with non-standard architectures |
-| `--patch-missing-eos` | Patch `tokenizer_config.json` for models like Qwen which don't use an EOS token |
+| `--patch-missing-eos` | Patch `tokenizer_config.json` for models like `Qwen` which don't use any `<BOS>` token |
 | `--overwrite` | Replace existing output directory |
 | `--verbose` | Show detailed token mapping output |
 
-**NOTE**: Some models like `Qwen` don't use any `bos_token_id`, so you can try to use the experimental option `--patch-missing-eos` to manually patch `tokenizer_config.json` to fix this. This may or may not be a good idea, depending on the backend you ultimately want to use the speculative model with...
+**NOTE**: Some models like `Qwen` don't use any `<BOS>` type token, so you can try to use the experimental option `--patch-missing-eos` to manually patch `tokenizer_config.json` to fix this. This may or may not be a good idea, depending on the backend you ultimately want to use the speculative model with...
 
 ### Examples
 

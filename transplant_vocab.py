@@ -44,7 +44,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--trust-remote-code", action = "store_true",
                        help = "Allow custom code execution when loading models with non-standard architectures")
     parser.add_argument("--patch-missing-eos", action = "store_true",
-                       help = "Patch `tokenizer_config.json` for models like Qwen which don't use an EOS token")
+                       help = "Patch `tokenizer_config.json` for models like `Qwen` which don't use any `<BOS>` token")
     parser.add_argument("--overwrite", action = "store_true",
                        help = "Overwrite output directory if it exists")
     parser.add_argument("--verbose", action = "store_true",

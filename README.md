@@ -47,13 +47,13 @@ python transplant_vocab.py /path/to/donor_model /path/to/target_model /path/to/o
 
 ### Examples
 
-A. Transplant `DeepSeek-R1` tokenizer into `Qwen2.5-0.5B-Instruct` model and output as new model called `DeepSeek-R1-DRAFT-0.5B`:
+#### Transplant `DeepSeek-R1` tokenizer into `Qwen2.5-0.5B-Instruct` model and output as new model called `DeepSeek-R1-DRAFT-0.5B`:
 
 ```bash
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B
 ```
 
-B. With manual token mapping overrides for chat templates (see below for detailed explanation):
+#### With manual token mapping overrides for chat templates (see below for detailed explanation):
 
 ```bash
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B \
@@ -62,25 +62,25 @@ python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-D
 	--override ...
 ```
 
-C. Use only first token for `lm_head` averaging (maximum front-loading):
+#### Use only first token for `lm_head` averaging (maximum front-loading):
 
 ```bash
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-first --weighting-decay-factor 0.0
 ```
 
-E. Use uniform mean for `lm_head` averaging (ie: equal weight to all tokens):
+#### Use uniform mean for `lm_head` averaging (ie: equal weight to all tokens):
 
 ```bash
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-mean --weighting-decay-factor 1.0
 ```
 
-F. Use decreasing weights (eg: 1, 0.5, 0.25, etc.) for `lm_head` averaging (default behaviour):
+#### Use decreasing weights (eg: 1, 0.5, 0.25, etc.) for `lm_head` averaging (default behaviour):
 
 ```bash
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-decay --weighting-decay-factor 0.5
 ```
 
-G. Trim out intermediate layers to create a smaller model that we can use for further fine-tuning:
+#### Trim out intermediate layers to create a smaller model that we can use for further fine-tuning:
 
 ```bash
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-trimmed --trim-layers 14-21
@@ -96,7 +96,7 @@ Trimming layers 14 through 21 (inclusive):
 - Updated model configuration so `num_hidden_layers = 16`.
 ```
 
-H. Reduce the intermediate size to 2432 (from 4864):
+#### Reduce the intermediate size to 2432 (from 4864):
 
 ```bash
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-small --trim-intermediate-size 2432

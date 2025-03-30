@@ -11,6 +11,7 @@ This tool allows you to combine the transformer architecture and weights from a 
 - Automatic special tokens mapping between models.
 - User-specified manual token mapping overrides.
 - (**only useful for fine-tuning**) Models can be "trimmed" by removing a range of layers.
+- (**only useful for fine-tuning**) Models can be "trimmed" by reducing the hidden state dimension of the MLP blocks.
 
 ## Installation
 
@@ -38,6 +39,7 @@ python transplant_vocab.py /path/to/donor_model /path/to/target_model /path/to/o
 | `--override TARGET DONOR` | Override target token with donor sequence (can be used multiple times) |
 | `--weighting-decay-factor [0-1]` | Decay factor for multi-token mappings: 0=first token only, 0.5=decreasing weights, 1=uniform mean |
 | `--trim-layers START-END` | Trim out a range of layers from the model: start-end (inclusive) |
+| `--trim-intermediate-size SIZE` | Trim the hidden state dimension of the MLP blocks |
 | `--use-cpu-only` | Use CPU instead of GPU (and with `float32` precision) |
 | `--trust-remote-code` | Allow custom code execution when loading models with non-standard architectures |
 | `--overwrite` | Replace existing output directory |
@@ -45,13 +47,13 @@ python transplant_vocab.py /path/to/donor_model /path/to/target_model /path/to/o
 
 ### Examples
 
-To transplant `DeepSeek-R1` tokenizer into `Qwen2.5-0.5B-Instruct` model and output as new model called `DeepSeek-R1-DRAFT-0.5B`:
+#### Transplant `DeepSeek-R1` tokenizer into `Qwen2.5-0.5B-Instruct` model and output as new model called `DeepSeek-R1-DRAFT-0.5B`:
 
 ```bash
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B
 ```
 
-With manual token mapping overrides for chat templates (see below for detailed explanation):
+#### With manual token mapping overrides for chat templates (see below for detailed explanation):
 
 ```bash
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B \
@@ -60,25 +62,25 @@ python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-D
 	--override ...
 ```
 
-Use only first token for `lm_head` averaging (maximum front-loading):
+#### Use only first token for `lm_head` averaging (maximum front-loading):
 
 ```bash
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-first --weighting-decay-factor 0.0
 ```
 
-Use uniform mean for `lm_head` averaging (ie: equal weight to all tokens):
+#### Use uniform mean for `lm_head` averaging (ie: equal weight to all tokens):
 
 ```bash
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-mean --weighting-decay-factor 1.0
 ```
 
-Use decreasing weights (eg: 1, 0.5, 0.25, etc.) for `lm_head` averaging (default behaviour):
+#### Use decreasing weights (eg: 1, 0.5, 0.25, etc.) for `lm_head` averaging (default behaviour):
 
 ```bash
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-decay --weighting-decay-factor 0.5
 ```
 
-Trim out intermediate layers to create a smaller model that we can use for further fine-tuning:
+#### Trim out intermediate layers to create a smaller model that we can use for further fine-tuning:
 
 ```bash
 python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-trimmed --trim-layers 14-21
@@ -92,6 +94,22 @@ Trimming layers 14 through 21 (inclusive):
 - New layer count : 16 (keeping layers 0-13 and 22-23)
 - Removed a total of 96 tensors from state_dict.
 - Updated model configuration so `num_hidden_layers = 16`.
+```
+
+#### Reduce the intermediate size to 2432 (from 4864):
+
+```bash
+python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-small --trim-intermediate-size 2432
+```
+
+to create a significantly smaller model:
+
+```
+Trimming intermediate size from 4864 to 2432: 
+- Old intermediate size : 4864
+- New intermediate size : 2432
+- Trimmed 72 tensors in state_dict
+- Updated model configuration so `intermediate_size = 2432`
 ```
 
 ### Token Mapping
@@ -213,7 +231,7 @@ The `--trim-layers` option allows you to remove a range of intermediate layers f
 
 ### Important Considerations
 
-- **Performance Impact**: Unlike vocabulary transplantation (which preserves most of the model's capabilities), layer trimming significantly impacts model performance. ***The resulting model will require fine-tuning*** to recover acceptable performance.
+- **Performance Impact**: Unlike vocabulary transplantation (which preserves most of the model's capabilities), layer trimming significantly impacts model performance. The resulting model will require fine-tuning to recover acceptable performance.
 - **Layer Selection Strategy**: Research such as ["The Unreasonable Ineffectiveness of the Deeper Layers"](https://arxiv.org/abs/2403.17887) suggests that not all layers contribute equally to model performance.
 - **Recommended Approach**: When trimming layers, it's generally advisable to:
   - Keep the very early layers (which transform embedding-space to hidden/latent representations)
@@ -227,15 +245,31 @@ For a 24-layer model like `Qwen2.5-0.5B-Instruct`, you might use `--trim-layers 
 
 This keeps layers 0-13 (the first 14 layers) and layers 22-23 (the final 2 layers), resulting in a 16-layer model that preserves both the input processing and output generation capabilities while removing 8 of the (later) intermediate layers. The resulting model will be approximately 2/3 the size and should run approximately 33% faster for speculative decoding.
 
-**IMPORTANT**: After trimming, you ***must fine-tune*** the model to recover performance. The trimmed model can serve as an excellent starting point for creating a smaller, faster draft model through additional fine-tuning, but it is ***unlikely to be useful without further fine-tuning***.
+**IMPORTANT**: After layer trimming, you ***must fine-tune*** the model to recover performance.
+
+## Intermediate Size Trimming
+
+The `--trim-intermediate-size` option allows you to reduce the hidden state dimension of the MLP blocks throughout the model. This can be useful for the same reasons as layer trimming.
+
+### Important Considerations
+
+- **Performance Impact**: Like layer trimming, reducing hidden state dimensions will impact model performance. The resulting model will require fine-tuning to recover acceptable performance.
+- **Recommended Approach**: When trimming intermediate size:
+  - Consider the ratio between the original and new size (e.g., reducing from 4864 to 2432 is a 50% reduction)
+  - Choose a size that is a multiple of 128 for compatibility with most hardware acceleration (e.g., 2432/128 = 19)
+
+**IMPORTANT**: After trimming intermediate size, you ***must fine-tune*** the model to recover performance.
 
 ## Design Rationale
 
 ### Input Embeddings (Final Token Strategy)
+
 When a target token maps to multiple donor tokens:
+
 ```text
 Target: [X] → Donor: [A, B, C]
 ```
+
 We use **C** (**ONLY** the final token) because:
 
 1. Transformers process tokens sequentially, with transformer blocks "looking backward".
@@ -244,10 +278,13 @@ We use **C** (**ONLY** the final token) because:
 4. Using the final token aligns with how the transformers process the previous token to create the next token.
 
 ### Output Head (First Token Strategy)
+
 When a target token maps to multiple donor tokens:
+
 ```text
 Target: [Y] → Donor: [D, E, F]
 ```
+
 We use **D** (**MOSTLY** the first token) because:
 
 1. The model decides on word endings in subsequent autoregressive passes.

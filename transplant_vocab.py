@@ -13,10 +13,10 @@ import os
 import re
 import shutil
 import sys
-from typing import Tuple, Dict
-
 import torch
 from tqdm import tqdm
+from typing import Tuple, Dict
+
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 import torch.nn as nn
@@ -114,22 +114,23 @@ def load_tokenizer(path: str, trust_remote_code = False) -> AutoTokenizer:
     except Exception as e:
         sys.exit(f"Failed to load tokenizer: {e}")
 
-def load_model(path: str, trust_remote_code = False, torch_dtype = None) -> AutoModelForCausalLM:
+def load_model(path: str, trust_remote_code = False, use_cpu_only = False) -> AutoModelForCausalLM:
     """Load model with error handling"""
     try:
         print(f"Loading model from '{path}'... ", end = "")
-        if torch_dtype is not None:
+        if use_cpu_only:
             model = AutoModelForCausalLM.from_pretrained(
                 path,
-                device_map = "auto",
                 trust_remote_code = trust_remote_code,
-                torch_dtype = torch_dtype
+                device_map = 'cpu',
+                torch_dtype = 'float32',
             )
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 path,
                 trust_remote_code = trust_remote_code,
-                device_map = "cpu"  # Will also load (and save) as torch.float32
+                device_map = 'auto',
+                torch_dtype = 'auto',
             )
         print("Done.")
         return model
@@ -671,6 +672,32 @@ def patch_tokenizer_config_bos(output_dir):
         except Exception as e:
             print(f"Warning: Failed to patch tokenizer configuration: {e}")
 
+def patch_config_dtype(output_dir, dtype):
+    """
+    Patch the config.json file with the specified dtype.
+    
+    Args:
+        output_dir: Path to the output directory containing the config.json
+        dtype: The dtype to set in the config file
+    """
+    config_path = os.path.join(output_dir, "config.json")
+    if os.path.exists(config_path):
+        print(f"\nPatching 'torch_dtype' in '{config_path}'")
+        try:
+            # Read the file as JSON
+            with open(config_path, "r") as f:
+                config = json.load(f)
+
+            # Update the dtype
+            config['torch_dtype'] = dtype
+            print(f"- Updated 'torch_dtype' to '{dtype}'.")
+
+            # Write the modified config back
+            with open(config_path, "w") as f:
+                json.dump(config, f, indent = 2)
+        except Exception as e:
+            print(f"Warning: Failed to patch config file: {e}")
+
 def debug_model_tensors(model, state_dict):
     """
     Print detailed information about model parameters and state dict tensors
@@ -738,10 +765,7 @@ def main():
     target_tokenizer = load_tokenizer(args.target_dir, args.trust_remote_code)
 
     # Load the donor model
-    if args.use_cpu_only:
-        model = load_model(args.donor_dir, args.trust_remote_code)
-    else:
-        model = load_model(args.donor_dir, args.trust_remote_code, get_config_value(donor_config, "torch_dtype", None))
+    model = load_model(args.donor_dir, args.trust_remote_code, args.use_cpu_only)
 
     # The config file counts the all tokens, but we also need to know how many are used for the loop
     used_target_vocab_size = max(target_tokenizer.vocab.values()) + 1
@@ -819,10 +843,9 @@ def main():
     if has_config_value(model.config, 'tie_word_embeddings'):
         set_config_value(model.config, 'tie_word_embeddings', False)
 
-    # Re-initialize the model with the updated configuration and load into it the new state dict
+    # Re-initialize the model with the updated configuration
     # NOTE: This seems to be more robust that just altering the model and state dict parameters
     model = type(model)(model.config)
-    model.load_state_dict(new_state_dict)
 
     output_num_layers = get_config_value(model.config, 'num_hidden_layers')
     output_tied_embeddings = get_config_value(model.config, "tie_word_embeddings", False)
@@ -854,7 +877,10 @@ def main():
     model.save_pretrained(args.output_dir, state_dict = new_state_dict, safe_serialization = True)
     target_tokenizer.save_pretrained(args.output_dir)
 
-    # Finally, attempt to patch the EOS stuff if the donor tokenizer doesn't use BOS tokens
+    # Patch the stupid `torch_dtype` bug in the config file where it always saves as float32 regardless of the actual type...
+    patch_config_dtype(args.output_dir, str(new_state_dict['model.embed_tokens.weight'].dtype).split('.')[-1])
+
+    # Attempt to patch the EOS stuff if the donor tokenizer doesn't use BOS tokens
     if args.patch_missing_bos and (getattr(donor_tokenizer, "add_bos_token", False)
                                    or getattr(donor_tokenizer, "bos_token", None) is None):
         patch_tokenizer_config_bos(args.output_dir)

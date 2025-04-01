@@ -37,8 +37,10 @@ def parse_arguments() -> argparse.Namespace:
                             "0=first token only, 0.5=decreasing weights, 1=uniform mean")
     parser.add_argument("--trim-layers", type = str,
                        help = "Trim out a range of layers from the model: start-end (inclusive)")
+    parser.add_argument("--trim-hidden-size", type = int,
+                       help = "Trim the hidden state dimension (and the number of heads as a result)")
     parser.add_argument("--trim-intermediate-size", type = int,
-                       help = "Trim the hidden state dimension of the MLP blocks")
+                       help = "Trim the intermediate dimension of the MLP blocks")
     parser.add_argument("--use-cpu-only", action = "store_true",
                        help = "Use CPU only for model loading and processing in float32")
     parser.add_argument("--trust-remote-code", action = "store_true",
@@ -134,6 +136,149 @@ def load_model(path: str, trust_remote_code = False, torch_dtype = None) -> Auto
     except Exception as e:
         sys.exit(f"Failed to load model: {e}")
 
+def count_model_parameters(model) -> Tuple[int, int, int]:
+    """
+    Count the total number of parameters in a model.
+    
+    Args:
+        model: The model to analyze
+        
+    Returns:
+        Tuple of (total parameters, embedding and LM head parameters only,
+                 parameters excluding embeddings and LM head)
+    """
+    total_params = 0
+    embedding_params = 0
+    non_embedding_params = 0
+
+    for name, param in model.named_parameters():
+        param_count = param.numel()
+        total_params += param_count
+
+        # Separate embedding/LM head parameters from the rest
+        if any(skip_name in name for skip_name in ['embed_tokens', 'lm_head']):
+            embedding_params += param_count
+        else:
+            non_embedding_params += param_count
+
+    return total_params, embedding_params, non_embedding_params
+
+def has_config_value(config, key: str) -> bool:
+    """Check if a key exists in a model configuration, checking both flat and nested structures"""
+    if isinstance(config, dict):
+        return key in config or ("text_config" in config and key in config["text_config"])
+    return hasattr(config, key) or (hasattr(config, "text_config") and hasattr(config.text_config, key))
+
+def get_config_value(config, key: str, default = ...):
+    """Get a value from a model configuration, handling both flat and nested structures"""
+    assert default is not ... or has_config_value(config, key), f"{key} not found in model configuration"
+    if not has_config_value(config, key):
+        return default
+    if isinstance(config, dict):
+        return config[key] if key in config else config["text_config"][key]
+    return getattr(config, key) if hasattr(config, key) else getattr(config.text_config, key)
+
+def set_config_value(config, key: str, value):
+    """Set a value in a model configuration, updating both flat and nested structures if present"""
+    assert has_config_value(config, key), f"{key} not found in model configuration"
+    if isinstance(config, dict):
+        if key in config:
+            config[key] = value
+        if "text_config" in config and key in config["text_config"]:
+            config["text_config"][key] = value
+    else:
+        if hasattr(config, key):
+            setattr(config, key, value)
+        if hasattr(config, "text_config") and hasattr(config.text_config, key):
+            setattr(config.text_config, key, value)
+
+def process_automatic_token_overrides(target_tokenizer, donor_tokenizer, target_config, donor_config, existing_map = None):
+    """
+    Process automatic token overrides for special tokens.
+    
+    Args:
+        target_tokenizer: The target tokenizer
+        donor_tokenizer: The donor tokenizer
+        target_config: The target model configuration
+        donor_config: The donor model configuration
+        
+    Returns:
+        Dictionary mapping target token IDs to donor token IDs
+    """
+    override_map = existing_map.copy() if existing_map else {}
+
+    special_tokens = ['bos_token_id', 'eos_token_id', 'pad_token_id']
+    print(f"\nProcessing {len(special_tokens)} automatic token overrides:")
+
+    for token_attr in special_tokens:
+        # First try to get from the tokenizer
+        target_token_id = getattr(target_tokenizer, token_attr)
+        donor_token_id = getattr(donor_tokenizer, token_attr)
+
+        # Try to get from config if not found in tokenizer
+        if target_token_id is None and has_config_value(target_config, token_attr):
+            target_token_id = get_config_value(target_config, token_attr)
+        if donor_token_id is None and has_config_value(donor_config, token_attr):
+            donor_token_id = get_config_value(donor_config, token_attr)
+
+        # Try to perform the automatic match
+        if target_token_id is not None:
+            if donor_token_id is not None:
+                if target_token_id not in override_map:
+                    target_token = target_tokenizer.convert_ids_to_tokens(target_token_id)
+                    donor_token = donor_tokenizer.convert_ids_to_tokens(donor_token_id)
+                    override_map[target_token_id] = torch.tensor([donor_token_id], dtype = torch.long)
+                    print(f"✔ {repr(token_attr)} : {target_token_id} {repr(target_token)} → [{donor_token_id}] {repr(donor_token)}")
+                else:
+                    print(f"✘ {repr(token_attr)} : {target_token_id} is already mapped to [{override_map[target_token_id].item()}]")
+            else:
+                print(f"✘ {repr(token_attr)} : Not found for donor model")
+        else:
+            print(f"✘ {repr(token_attr)} : Not found for target model")
+
+    return override_map
+
+def process_manual_token_overrides(target_tokenizer, donor_tokenizer, manual_overrides, existing_map = None):
+    """
+    Process manual token overrides specified by the user.
+    
+    Args:
+        target_tokenizer: The target tokenizer
+        donor_tokenizer: The donor tokenizer
+        manual_overrides: List of (target_token, donor_tokens) pairs
+        existing_map: Existing override map to update (optional)
+        
+    Returns:
+        Updated dictionary mapping target token IDs to donor token IDs
+    """
+    override_map = existing_map.copy() if existing_map else {}
+
+    if not manual_overrides:
+        return override_map
+
+    print(f"\nProcessing {len(manual_overrides)} manual token overrides:")
+    for target_token, donor_tokens in manual_overrides:
+        # Encode target token and verify it's a single token
+        target_id = target_tokenizer.encode(target_token, add_special_tokens = False)
+        assert len(target_id) == 1, f"Target token '{target_token}' maps to {len(target_id)} tokens. Must be a 1 token."
+        target_id = target_id[0]
+
+        # Replace newline characters with the actual byte representation of a newline (0x0A)
+        # NOTE: If you don't do this then it will get wrongly encoded as the "\\n" string literal
+        if "\\n" in donor_tokens:
+            donor_tokens = donor_tokens.replace("\\n", chr(10))
+
+        # Get the IDs from the token string
+        encoded = donor_tokenizer.encode(donor_tokens, add_special_tokens = False, return_tensors = "pt").flatten()
+        assert encoded.numel() != 0, f"Donor token '{donor_tokens}' for target ID {target_id} encodes to 0 tokens."
+
+        # Store the donor token IDs
+        override_map[target_id] = encoded
+
+        print(f"✔ {target_id:6d} : {repr(target_token)} → {encoded.tolist()} {repr(donor_tokens)}")
+
+    return override_map
+
 def compute_front_loaded_mean(v, weighting_decay_factor = 0.5):
     """
     Computes the "front-loaded" exponentially-weighted mean with a weighting decay factor.
@@ -167,6 +312,112 @@ def compute_front_loaded_mean(v, weighting_decay_factor = 0.5):
         denominator = torch.sum(decay_powers)
         return weighted_sum / denominator
 
+def transplant_tokens(model, donor_config, target_tokenizer, donor_tokenizer,
+                      override_map, vocab_size, used_vocab_size,
+                      weighting_decay_factor, verbose = False):
+    """
+    Transplant token embeddings from donor model to target vocabulary.
+    
+    Args:
+        model: The donor model
+        donor_config: The donor model configuration
+        target_tokenizer: The target tokenizer
+        donor_tokenizer: The donor tokenizer
+        override_map: Dictionary mapping target token IDs to donor token IDs
+        vocab_size: Total size of the target vocabulary
+        used_vocab_size: Number of tokens actually used in the target vocabulary
+        weighting_decay_factor: Factor for weighting multi-token mappings
+        verbose: Whether to print detailed mapping information
+        
+    Returns:
+        Tuple of (new state dict, embedding statistics)
+    """
+    # Get donor hidden size
+    donor_hidden_size = get_config_value(donor_config, "hidden_size")
+
+    # Get donor embeddings
+    donor_embed_tokens = model.model.embed_tokens.weight
+    if get_config_value(donor_config, "tie_word_embeddings", False):
+        print("\nNOTE: Using an \"untied\" copy of 'embed_tokens.weight' as new 'lm_head.weight' tensor...\n")
+        donor_lm_head = model.model.embed_tokens.weight
+    else:
+        print("\nNOTE: Using actual 'lm_head.weight' tensor as donor not configured with 'tie_word_embeddings...\n")
+        donor_lm_head = model.lm_head.weight
+
+    # Initialize new embedding and head tensors with zeros
+    new_embed_tokens = torch.zeros(
+        (vocab_size, donor_hidden_size),
+        dtype = donor_embed_tokens.dtype,
+        device = donor_embed_tokens.device
+    )
+    new_lm_head = torch.zeros(
+        (vocab_size, donor_hidden_size),
+        dtype = donor_lm_head.dtype,
+        device = donor_lm_head.device
+    )
+
+    # Track mapping statistics
+    mapping_counts = {}
+    lm_head_copy_count = 0
+    lm_head_mean_count = 0
+
+    # Configure progress display
+    iterator = range(used_vocab_size)
+    if verbose:
+        print("Transplanting tokens:")
+    else:
+        iterator = tqdm(iterator, desc = "Transplanting tokens", unit = "token")
+
+    for idx in iterator:
+        decoded = target_tokenizer.decode([idx], decode_special_tokens = True)
+        if idx in override_map:
+            encoded = override_map[idx]
+        else:
+            encoded = donor_tokenizer.encode(decoded, add_special_tokens = False, return_tensors = "pt").flatten()
+
+        if verbose:
+            print(f"- {idx:6d} : {repr(decoded)} → {encoded.tolist()}")
+
+        # Track mapping types
+        if encoded.numel() in mapping_counts:
+            mapping_counts[encoded.numel()] += 1
+        else:
+            mapping_counts[encoded.numel()] = 1
+
+        # Use only the final token of encoded sequence for input embeddings
+        new_embed_tokens[idx] = donor_embed_tokens[encoded[-1]]
+
+        # Use a "front-loaded" exponentially-weighted mean for lm_head embeddings
+        if encoded.numel() == 1:
+            new_lm_head[idx] = donor_lm_head[encoded[0].item()]
+            lm_head_copy_count += 1
+        else:
+            head_embeddings = donor_lm_head[encoded.flatten()]
+            new_lm_head[idx] = compute_front_loaded_mean(head_embeddings, weighting_decay_factor)
+            lm_head_mean_count += 1
+
+    # Print statistics
+    print("\nTransplant mappings:")
+    for count, occurrences in sorted(mapping_counts.items()):
+        mapping_label = f"{count} to 1"
+        print(f"- {mapping_label:<8}: {occurrences} ({(occurrences/used_vocab_size*100):.2g}%)")
+
+    print("\nHead initialized with:")
+    lm_head_zeroed_count = vocab_size - (lm_head_copy_count + lm_head_mean_count)
+    print(f"- Copies : {lm_head_copy_count} ({(lm_head_copy_count/vocab_size*100):.2g}%)")
+    print(f"- Means  : {lm_head_mean_count} ({(lm_head_mean_count/vocab_size*100):.2g}%)")
+    print(f"- Zeros  : {lm_head_zeroed_count} ({(lm_head_zeroed_count/vocab_size*100):.2g}%)")
+
+    # Make a copy of the model's state_dict and get the type
+    new_state_dict = model.state_dict().copy()
+    old_dtype = model.model.embed_tokens.weight.dtype
+
+    # Update the state_dict with new embeddings
+    new_state_dict['model.embed_tokens.weight'] = new_embed_tokens.to(dtype = old_dtype)
+    new_state_dict['lm_head.weight'] = new_lm_head.to(dtype = old_dtype)
+
+    return new_state_dict
+
 def trim_model_layers(model, state_dict, start_layer, end_layer):
     """
     Trim out a range of layers from the model and its state_dict.
@@ -180,18 +431,19 @@ def trim_model_layers(model, state_dict, start_layer, end_layer):
     Returns:
         Tuple of (modified model, modified state_dict)
     """
-    print(f"\nTrimming layers {start_layer} through {end_layer} (inclusive): ")
-
     # Get the total number of layers in the model
-    assert hasattr(model.config, 'num_hidden_layers'), "Could not determine the number of layers in the model"
-    total_layers = model.config.num_hidden_layers
+    total_layers = get_config_value(model.config, 'num_hidden_layers')
+    assert start_layer >= 0 and start_layer < end_layer and end_layer < total_layers, f"Invalid layer range: start={start_layer}, end={end_layer}, total={total_layers}"
 
-    assert end_layer < total_layers, f"End layer {end_layer} exceeds the total number of layers {total_layers}"
+    print(f"\nTrimming layers {start_layer} through {end_layer} (inclusive): ")
 
     # Calculate how many layers to keep
     new_layer_count = total_layers - (end_layer - start_layer + 1)
     print(f"- Old layer count : {total_layers} (layers 0-{total_layers-1})")
     print(f"- New layer count : {new_layer_count} (keeping layers 0-{start_layer-1} and {end_layer+1}-{total_layers-1})")
+
+    # Update the model configuration
+    set_config_value(model.config, 'num_hidden_layers', new_layer_count)
 
     # Create a mapping from old layer indices to new layer indices
     layer_mapping = {}
@@ -241,13 +493,6 @@ def trim_model_layers(model, state_dict, start_layer, end_layer):
         if layer_match is None and key not in removed_keys and not any(key == old_key for old_key, _ in renamed_keys):
             new_state_dict[key] = state_dict[key].clone()
 
-    # Update the model configuration
-    model.config.num_hidden_layers = new_layer_count
-
-    # Also update nested configurations if present (for models like Gemma, Llama, etc.)
-    if hasattr(model.config, 'text_config') and hasattr(model.config.text_config, 'num_hidden_layers'):
-        model.config.text_config.num_hidden_layers = new_layer_count
-
     # For models with specific architectures, we might need to modify the layers list
     if hasattr(model, 'model') and hasattr(model.model, 'layers'):
         # Create a new ModuleList with only the layers we want to keep
@@ -259,43 +504,28 @@ def trim_model_layers(model, state_dict, start_layer, end_layer):
 
     print(f"- Removed {len(removed_keys)} tensors from state_dict")
     print(f"- Renamed {len(renamed_keys)} layer tensors to new indices")
-    print(f"- Updated model configuration so `num_hidden_layers = {new_layer_count}`")
+    print(f"- Updated model configuration: num_hidden_layers = {new_layer_count}")
 
     return model, new_state_dict
 
-def trim_model_intermediate_size(model, state_dict, new_size):
+def trim_tensors(state_dict, old_size, new_size):
     """
-    Trim the hidden state dimension of the MLP blocks.
+    Trim all tensors in a state dictionary that have dimensions matching old_size.
     
     Args:
-        model: The model to modify
         state_dict: The state dictionary to modify
-        new_intermediate_size: The new hidden state dimension to use
+        old_size: The original dimension size to look for
+        new_size: The new dimension size to trim to
     
     Returns:
-        Tuple of (modified model, modified state_dict)
+        Tuple of (new state dict, count of trimmed tensors)
     """
-    # Get the current intermediate_size from the model config
-    old_size = model.config.intermediate_size
-
-    assert new_size < old_size, f"New intermediate size ({new_size}) must be smaller than old ({old_size})"
-
-    print(f"\nTrimming intermediate size from {old_size} to {new_size}: ")
-
-    # Create a new state dict with trimmed tensors
     new_state_dict = {}
     trimmed_count = 0
 
-    # Update the model's configuration
-    model.config.intermediate_size = new_size
-
-    # Also update nested configurations if present (for models like Gemma, Llama, etc.)
-    if hasattr(model.config, 'text_config') and hasattr(model.config.text_config, 'intermediate_size'):
-        model.config.text_config.intermediate_size = new_size
-
     # Process each tensor in the state dict
     for key, tensor in state_dict.items():
-        # Check if this tensor has a dimension matching the hidden size
+        # Check if this tensor has a dimension matching the size to trim
         if any(dim == old_size for dim in tensor.shape):
             # Create a new tensor with the appropriate dimensions
             new_shape = list(tensor.shape)
@@ -341,15 +571,105 @@ def trim_model_intermediate_size(model, state_dict, new_size):
             new_state_dict[key] = new_tensor
             trimmed_count += 1
         else:
-            # Keep tensors that don't have hidden size dimensions unchanged
+            # Keep tensors that don't have matching dimensions unchanged
             new_state_dict[key] = tensor.clone()
 
-    print(f"- Old intermediate size : {old_size}")
-    print(f"- New intermediate size : {new_size}")
+    return new_state_dict, trimmed_count
+
+def trim_model_hidden_size(model, state_dict, new_size):
+    """
+    Trim the hidden state dimension of the residual stream.
+    
+    Args:
+        model: The model to modify
+        state_dict: The state dictionary to modify
+        new_size: The new hidden state dimension to use
+    
+    Returns:
+        Tuple of (modified model, modified state_dict)
+    """
+    old_size = get_config_value(model.config, 'hidden_size')
+    old_num_heads = get_config_value(model.config, 'num_attention_heads')
+    old_num_kv_heads = get_config_value(model.config, 'num_key_value_heads')
+    assert new_size < old_size, f"New hidden size ({new_size}) must be smaller than old ({old_size})"
+    assert old_size % old_num_heads == 0, f"Old hidden size ({old_size}) is not divisible by number of heads ({old_num_heads})"
+
+    head_dimension = old_size // old_num_heads
+    assert new_size % head_dimension == 0, f"New hidden size ({new_size}) is not divisible by head dimension ({head_dimension})"
+
+    new_num_heads = new_size // head_dimension
+    assert new_num_heads >= old_num_kv_heads, f"New num heads({new_num_heads}) is less than KV heads {old_num_kv_heads})"
+
+    print(f"\nTrimming hidden size from {old_size} to {new_size}: ")
+    print(f"- Old hidden size : {old_size}")
+    print(f"- New hidden size : {new_size}")
+
+    set_config_value(model.config, 'hidden_size', new_size)
+    set_config_value(model.config, 'num_attention_heads', new_num_heads)
+    print(f"- Updated model configuration: hidden_size = {new_size}")
+    print(f"- Updated model configuration: num_attention_heads = {new_num_heads}")
+
+    new_state_dict, trimmed_count = trim_tensors(state_dict, old_size, new_size)
     print(f"- Trimmed {trimmed_count} tensors in state_dict")
-    print(f"- Updated model configuration so `intermediate_size = {new_size}`")
 
     return model, new_state_dict
+
+def trim_model_intermediate_size(model, state_dict, new_size):
+    """
+    Trim the hidden state dimension of the MLP blocks.
+    
+    Args:
+        model: The model to modify
+        state_dict: The state dictionary to modify
+        new_size: The new hidden state dimension to use
+    
+    Returns:
+        Tuple of (modified model, modified state_dict)
+    """
+    old_size = get_config_value(model.config, 'intermediate_size')
+    assert new_size < old_size, f"New intermediate size ({new_size}) must be smaller than old ({old_size})"
+
+    print(f"\nTrimming intermediate size from {old_size} to {new_size}: ")
+    print(f"- Old intermediate size : {old_size}")
+    print(f"- New intermediate size : {new_size}")
+
+    set_config_value(model.config, 'intermediate_size', new_size)
+    print(f"- Updated model configuration: intermediate_size = {new_size}")
+
+    new_state_dict, trimmed_count = trim_tensors(state_dict, old_size, new_size)
+    print(f"- Trimmed {trimmed_count} tensors in state_dict")
+
+    return model, new_state_dict
+
+def patch_tokenizer_config_bos(output_dir):
+    """
+    Patch the tokenizer configuration to handle models without BOS tokens.
+    
+    Args:
+        output_dir: Path to the output directory containing the tokenizer_config.json
+    """
+    tokenizer_config_path = os.path.join(output_dir, "tokenizer_config.json")
+    if os.path.exists(tokenizer_config_path):
+        print(f"\nPatching BOS handling in '{tokenizer_config_path}'")
+        try:
+            # Read the file as text without specifying encoding
+            with open(tokenizer_config_path, "r") as f:
+                config_text = f.read()
+
+            # Make sure that add_bos_token is set to false
+            config_text = config_text.replace('"add_bos_token": true', '"add_bos_token": false')
+            print("- Updated 'add_bos_token' configuration.")
+
+            # Remove any use of bos_token from chat template
+            # NOTE: We can't (safely) set '"bos_token": null', but it shouldn't matter with these two patches...
+            config_text = config_text.replace("{{ bos_token }}", "").replace("{{bos_token}}", "")
+            print("- Removed all references to 'bos_token' from Jinja chat template.")
+
+            # Write the modified text back without specifying encoding
+            with open(tokenizer_config_path, "w") as f:
+                f.write(config_text)
+        except Exception as e:
+            print(f"Warning: Failed to patch tokenizer configuration: {e}")
 
 def debug_model_tensors(model, state_dict):
     """
@@ -404,33 +724,14 @@ def main():
     donor_config = load_model_config(args.donor_dir)
     target_config = load_model_config(args.target_dir)
 
-    # Get the donor vocabulary size (for both flat and nested configurations)
-    if "text_config" in donor_config and "vocab_size" in donor_config["text_config"]:
-        donor_vocab_size = donor_config["text_config"]["vocab_size"]
-    else:
-        assert "vocab_size" in donor_config, "vocab_size not found in source model config"
-        donor_vocab_size = donor_config["vocab_size"]
-
-    # Get the donor hidden size (for both flat and nested configurations)
-    if "text_config" in donor_config and "hidden_size" in donor_config["text_config"]:
-        donor_hidden_size = donor_config["text_config"]["hidden_size"]
-    else:
-        assert "hidden_size" in donor_config, "hidden_size not found in source model config"
-        donor_hidden_size = donor_config["hidden_size"]
-
-    # Get the intermediate hidden size (for both flat and nested configurations)
-    if "text_config" in donor_config and "intermediate_size" in donor_config["text_config"]:
-        donor_intermediate_size = donor_config["text_config"]["intermediate_size"]
-    else:
-        assert "intermediate_size" in donor_config, "intermediate_size not found in source model config"
-        donor_intermediate_size = donor_config["intermediate_size"]
-
-    # Get the target vocabulary size (for both flat and nested configurations)
-    if "text_config" in target_config and "vocab_size" in target_config["text_config"]:
-        target_vocab_size = target_config["text_config"]["vocab_size"]
-    else:
-        assert "vocab_size" in target_config, "vocab_size not found in target model config"
-        target_vocab_size = target_config["vocab_size"]
+    # Get configuration values we will need
+    target_vocab_size = get_config_value(target_config, "vocab_size")
+    donor_vocab_size = get_config_value(donor_config, "vocab_size")
+    donor_num_layers = get_config_value(donor_config, 'num_hidden_layers')
+    donor_tied_embeddings = get_config_value(donor_config, "tie_word_embeddings", False)
+    donor_hidden_size = get_config_value(donor_config, "hidden_size")
+    donor_num_heads = get_config_value(donor_config, "num_attention_heads")
+    donor_intermediate_size = get_config_value(donor_config, "intermediate_size")
 
     # Load tokenizers
     donor_tokenizer = load_tokenizer(args.donor_dir, args.trust_remote_code)
@@ -440,156 +741,59 @@ def main():
     if args.use_cpu_only:
         model = load_model(args.donor_dir, args.trust_remote_code)
     else:
-        model = load_model(args.donor_dir, args.trust_remote_code, donor_config.get("torch_dtype", None))
+        model = load_model(args.donor_dir, args.trust_remote_code, get_config_value(donor_config, "torch_dtype", None))
 
     # The config file counts the all tokens, but we also need to know how many are used for the loop
     used_target_vocab_size = max(target_tokenizer.vocab.values()) + 1
     unused_target_vocab_size = target_vocab_size - used_target_vocab_size
 
-    print("\nLoaded OK:")
-    print(f"- Donor vocabulary size   : {donor_vocab_size}")
-    print(f"- Donor hidden size       : {donor_hidden_size}")
-    print(f"- Donor intermediate size : {donor_intermediate_size} (ratio = 1:{donor_intermediate_size/donor_hidden_size:.1f})")
-    print(f"- Target vocabulary size  : {target_vocab_size} (used = {used_target_vocab_size}, unused = {unused_target_vocab_size})")
+    # Count parameters in donor model
+    donor_total_params, donor_embedding_params, donor_non_embedding_params = count_model_parameters(model)
+    donor_total_params_b = donor_total_params / 1e9
+    donor_embedding_params_b = donor_embedding_params / 1e9
+    donor_non_embedding_params_b = donor_non_embedding_params / 1e9
+
+    print("\nInput model configuration:")
+    print(f"- Target vocabulary size    : {target_vocab_size} (used = {used_target_vocab_size}, unused = {unused_target_vocab_size})")
+    print(f"- Donor vocabulary size     : {donor_vocab_size}")
+    print(f"- Donor num layers          : {donor_num_layers} (tied embeddings = {donor_tied_embeddings})")
+    print(f"- Donor hidden size         : {donor_hidden_size}")
+    print(f"- Donor attention heads     : {donor_num_heads}")
+    print(f"- Donor intermediate size   : {donor_intermediate_size} (ratio = 1:{donor_intermediate_size/donor_hidden_size:.1f})")
+    print(f"- Donor total parameters    : {donor_total_params} ({donor_total_params_b:.2f}B)")
+    print(f"-- Embedding parameters     : {donor_embedding_params} ({donor_embedding_params_b:.2f}B)")
+    print(f"-- Non-embedding parameters : {donor_non_embedding_params} ({donor_non_embedding_params_b:.2f}B)")
 
     # Automatic and manual overrides
     override_map = {}
 
-    # Process the automatic overrides
-    special_tokens = ['bos_token_id', 'eos_token_id', 'pad_token_id']
-    print(f"\nProcessing {len(special_tokens)} automatic token overrides:")
-    for token_attr in special_tokens:
-        # First try to get from the tokenizer
-        target_token_id = getattr(target_tokenizer, token_attr)
-        donor_token_id = getattr(donor_tokenizer, token_attr)
-
-        # Try to get from config if not found in tokenizer
-        if target_token_id is None and token_attr in target_config:
-            target_token_id = target_config[token_attr]
-        if donor_token_id is None and token_attr in donor_config:
-            donor_token_id = donor_config[token_attr]
-
-        # Try to perform the automatic match
-        if target_token_id is not None:
-            if donor_token_id is not None:
-                if target_token_id not in override_map:
-                    target_token = target_tokenizer.convert_ids_to_tokens(target_token_id)
-                    donor_token = donor_tokenizer.convert_ids_to_tokens(donor_token_id)
-                    override_map[target_token_id] = torch.tensor([donor_token_id], dtype = torch.long)
-                    print(f"✔ {repr(token_attr)} : {target_token_id} {repr(target_token)} → [{donor_token_id}] {repr(donor_token)}")
-                else:
-                    print(f"✘ {repr(token_attr)} : {target_token_id} is already mapped to [{override_map[target_token_id].item()}]")
-            else:
-                print(f"✘ {repr(token_attr)} : Not found for donor model");
-        else:
-            print(f"✘ {repr(token_attr)} : Not found for target model");
+    # Process automatic and manual token overrides
+    override_map = process_automatic_token_overrides(target_tokenizer, donor_tokenizer, target_config, donor_config)
 
     # Process manual token overrides
-    if args.override:
-        print(f"\nProcessing {len(args.override)} manual token overrides:")
-        for target_token, donor_tokens in args.override:
-            # Encode target token and verify it's a single token
-            target_id = target_tokenizer.encode(target_token, add_special_tokens = False)
-            assert len(target_id) == 1, f"Target token '{target_token}' maps to {len(target_id)} tokens. Must be a 1 token."
-            target_id = target_id[0]
+    override_map = process_manual_token_overrides(target_tokenizer, donor_tokenizer, args.override, override_map)
 
-            # Replace newline characters with the actual byte representation of a newline (0x0A)
-            # NOTE: If you don't do this then it will get wrong;y encoded as the "\\n" string literal
-            if "\\n" in donor_tokens:
-                donor_tokens = donor_tokens.replace("\\n", chr(10))
-
-            # Get the IDs from the token string
-            encoded = donor_tokenizer.encode(donor_tokens, add_special_tokens = False, return_tensors = "pt").flatten()
-            assert encoded.numel() != 0, f"Donor token '{donor_tokens}' for target ID {idx} encodes to 0 tokens."
-
-            # Store the donor token IDs
-            override_map[target_id] = encoded
-
-            print(f"✔ {target_id:6d} : {repr(target_token)} → {encoded.tolist()} {repr(donor_tokens)}")
-    print()
-
-    # NOTE: We need to "untie" the lm_head weights for models with tie_word_embeddings = True
-    donor_embed_tokens = model.model.embed_tokens.weight
-    donor_lm_head = model.model.embed_tokens.weight if donor_config.get("tie_word_embeddings", False) else model.lm_head.weight
-
-    # Initialize new embedding and head tensors with zeros
-    new_embed_tokens = torch.zeros(
-        (target_vocab_size, donor_hidden_size),
-        dtype = donor_embed_tokens.dtype,
-        device = donor_embed_tokens.device
+    # Transplant tokens from donor model to target vocabulary
+    new_state_dict = transplant_tokens(
+        model = model,
+        donor_config = donor_config,
+        target_tokenizer = target_tokenizer,
+        donor_tokenizer = donor_tokenizer,
+        override_map = override_map,
+        vocab_size = target_vocab_size,
+        used_vocab_size = used_target_vocab_size,
+        weighting_decay_factor = args.weighting_decay_factor,
+        verbose = args.verbose
     )
-    new_lm_head = torch.zeros(
-        (target_vocab_size, donor_hidden_size),
-        dtype = donor_lm_head.dtype,
-        device = donor_lm_head.device
-    )
-
-    # Track mapping statistics
-    mapping_counts = {}
-
-    # Track lm_head statistics
-    lm_head_copy_count = 0
-    lm_head_mean_count = 0
-
-    # Configure progress display
-    iterator = range(used_target_vocab_size)
-    if args.verbose:
-        print("Transplanting tokens:")
-    else:
-        iterator = tqdm(iterator, desc = "Transplanting tokens", unit = "token")
-
-    for idx in iterator:
-        decoded = target_tokenizer.decode([idx], decode_special_tokens = True)
-        if idx in override_map:
-            encoded = override_map[idx]
-        else:
-            encoded = donor_tokenizer.encode(decoded, add_special_tokens = False, return_tensors = "pt").flatten()
-
-        if args.verbose:
-            print(f"- {idx:6d} : {repr(decoded)} → {encoded.tolist()}")
-
-        # Track mapping types
-        if encoded.numel() in mapping_counts:
-            mapping_counts[encoded.numel()] += 1
-        else:
-            mapping_counts[encoded.numel()] = 1
-
-        # Use only the final token of encoded sequence for input embeddings
-        new_embed_tokens[idx] = donor_embed_tokens[encoded[-1]]
-
-        # Use a "front-loaded" exponentially-weighted mean for lm_head embeddings
-        if encoded.numel() == 1:
-            new_lm_head[idx] = donor_lm_head[encoded[0].item()]
-            lm_head_copy_count += 1
-        else:
-            head_embeddings = donor_lm_head[encoded.flatten()]
-            new_lm_head[idx] = compute_front_loaded_mean(head_embeddings, args.weighting_decay_factor)
-            lm_head_mean_count += 1
-
-    # Print statistics
-    print("\nTransplant mappings:")
-    for count, occurrences in sorted(mapping_counts.items()):
-        mapping_label = f"{count} to 1"
-        print(f"- {mapping_label:<8}: {occurrences} ({(occurrences/used_target_vocab_size*100):.2g}%)")
-
-    print("\nHead initialized with:")
-    lm_head_zeroed_count = target_vocab_size - (lm_head_copy_count + lm_head_mean_count)
-    print(f"- Copies : {lm_head_copy_count} ({(lm_head_copy_count/target_vocab_size*100):.2g}%)")
-    print(f"- Means  : {lm_head_mean_count} ({(lm_head_mean_count/target_vocab_size*100):.2g}%)")
-    print(f"- Zeros  : {lm_head_zeroed_count} ({(lm_head_zeroed_count/target_vocab_size*100):.2g}%)")
-
-    # Make a copy of the model's state_dict and get the type
-    new_state_dict = model.state_dict().copy()
-    old_dtype = model.model.embed_tokens.weight.dtype
-
-    # Update the state_dict with new embeddings
-    new_state_dict['model.embed_tokens.weight'] = new_embed_tokens.to(dtype = old_dtype)
-    new_state_dict['lm_head.weight'] = new_lm_head.to(dtype = old_dtype)
 
     # Trim layers if requested
     if args.trim_layers:
         start_layer, end_layer = map(int, args.trim_layers.split('-'))
         model, new_state_dict = trim_model_layers(model, new_state_dict, start_layer, end_layer)
+
+    # Trim hidden size if requested
+    if args.trim_hidden_size:
+        model, new_state_dict = trim_model_hidden_size(model, new_state_dict, args.trim_hidden_size)
 
     # Trim intermediate size if requested
     if args.trim_intermediate_size:
@@ -600,27 +804,48 @@ def main():
     model.lm_head.out_features = target_vocab_size
 
     # Update model config
-    model.config.update({
-        'vocab_size': target_vocab_size,
-        'bos_token_id': target_tokenizer.bos_token_id,
-        'eos_token_id': target_tokenizer.eos_token_id,
-    })
+    set_config_value(model.config, 'vocab_size', target_vocab_size)
+    set_config_value(model.config, 'bos_token_id', target_tokenizer.bos_token_id)
+    set_config_value(model.config, 'eos_token_id', target_tokenizer.eos_token_id)
 
     # Update the config's pad_token_id if it exists
-    if hasattr(model.config, 'pad_token_id'):
+    if has_config_value(model.config, 'pad_token_id'):
         if target_tokenizer.pad_token_id is not None:
-            model.config.update({'pad_token_id': target_tokenizer.pad_token_id})
+            set_config_value(model.config, 'pad_token_id', target_tokenizer.pad_token_id)
         else:
-            model.config.update({'pad_token_id': target_tokenizer.eos_token_id})  # Default to EOS if no PAD to copy
+            set_config_value(model.config, 'pad_token_id', target_tokenizer.eos_token_id)  # Default to EOS if no PAD to copy
 
     # Set the config's tie_word_embeddings to False if it exists
-    if hasattr(model.config, 'tie_word_embeddings'):
-        model.config.update({'tie_word_embeddings': False})
+    if has_config_value(model.config, 'tie_word_embeddings'):
+        set_config_value(model.config, 'tie_word_embeddings', False)
 
     # Re-initialize the model with the updated configuration and load into it the new state dict
     # NOTE: This seems to be more robust that just altering the model and state dict parameters
     model = type(model)(model.config)
     model.load_state_dict(new_state_dict)
+
+    output_num_layers = get_config_value(model.config, 'num_hidden_layers')
+    output_tied_embeddings = get_config_value(model.config, "tie_word_embeddings", False)
+    output_hidden_size = get_config_value(model.config, "hidden_size")
+    output_num_heads = get_config_value(model.config, "num_attention_heads")
+    output_intermediate_size = get_config_value(model.config, "intermediate_size")
+
+    # Count parameters in output model
+    output_total_params, output_embedding_params, output_non_embedding_params = count_model_parameters(model)
+    output_total_params_b = output_total_params / 1e9
+    output_embedding_params_b = output_embedding_params / 1e9
+    output_non_embedding_params_b = output_non_embedding_params / 1e9
+
+    # Print output model configuration values
+    print("\nOutput model configuration:")
+    print(f"- Output vocabulary size    : {target_vocab_size}")
+    print(f"- Output num layers         : {output_num_layers} (tied embeddings = {output_tied_embeddings})")
+    print(f"- Output hidden size        : {output_hidden_size}")
+    print(f"- Output attention heads    : {output_num_heads}")
+    print(f"- Output intermediate size  : {output_intermediate_size} (ratio = 1:{output_intermediate_size/output_hidden_size:.1f})")
+    print(f"- Output total parameters   : {output_total_params} ({output_total_params_b:.2f}B)")
+    print(f"-- Embedding parameters     : {output_embedding_params} ({output_embedding_params_b:.2f}B)")
+    print(f"-- Non-embedding parameters : {output_non_embedding_params} ({output_non_embedding_params_b:.2f}B)")
 
     # debug_model_tensors(model, new_state_dict)
 
@@ -632,28 +857,7 @@ def main():
     # Finally, attempt to patch the EOS stuff if the donor tokenizer doesn't use BOS tokens
     if args.patch_missing_bos and (getattr(donor_tokenizer, "add_bos_token", False)
                                    or getattr(donor_tokenizer, "bos_token", None) is None):
-        tokenizer_config_path = os.path.join(args.output_dir, "tokenizer_config.json")
-        if os.path.exists(tokenizer_config_path):
-            print(f"\nPatching BOS handling in '{tokenizer_config_path}'")
-            try:
-                # Read the file as text without specifying encoding
-                with open(tokenizer_config_path, "r") as f:
-                    config_text = f.read()
-
-                # Make sure that add_bos_token is set to false
-                config_text = config_text.replace('"add_bos_token": true', '"add_bos_token": false')
-                print("- Updated 'add_bos_token' configuration.")
-
-                # Remove any use of bos_token from chat template
-                # NOTE: We can't (safely) set '"bos_token": null', but it shouldn't matter with these two patches...
-                config_text = config_text.replace("{{ bos_token }}", "").replace("{{bos_token}}", "")
-                print("- Removed all references to 'bos_token' from Jinja chat template.")
-
-                # Write the modified text back without specifying encoding
-                with open(tokenizer_config_path, "w") as f:
-                    f.write(config_text)
-            except Exception as e:
-                print(f"Warning: Failed to patch tokenizer configuration: {e}")
+        patch_tokenizer_config_bos(args.output_dir)
 
     # TODO: Figure out why it causes a segmentation fault on exit???
     print("\nOperation completed successfully (ignore any 'segmentation fault' that follows!!!)")

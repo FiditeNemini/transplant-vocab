@@ -2,6 +2,27 @@
 
 Transplants vocabulary between language models, enabling the creation of draft models for efficient speculative decoding **WITHOUT** retraining.
 
+## Table of Contents
+
+- [Features](#features)
+- [Installation](#installation)
+- [Usage](#usage)
+  - [Basic Command](#basic-command)
+  - [Options](#options)
+  - [Examples](#examples)
+- [Token Mapping](#token-mapping)
+  - [Automatic Special Token Mapping](#automatic-special-token-mapping)
+  - [Manual Token Mapping Overrides](#manual-token-mapping-overrides)
+- [Layer Trimming](#layer-trimming)
+- [Hidden and Intermediate Size Trimming](#hidden-and-intermediate-size-trimming)
+- [Handling Models Without BOS Tokens](#handling-models-without-bos-tokens)
+- [Design Rationale](#design-rationale)
+  - [Input Embeddings (Final Token Strategy)](#input-embeddings-final-token-strategy)
+  - [Output Head (First Token Strategy)](#output-head-first-token-strategy)
+  - [Mathematical Considerations](#mathematical-considerations)
+- [Credit](#credit)
+- [License](#license)
+
 This tool allows you to combine the transformer architecture and weights from a donor model with the tokenizer of a target model, creating a hybrid model that can serve as a draft model in speculative decoding pipelines. By matching token-to-token or multi-token mappings between vocabularies, it intelligently transfers embeddings while preserving semantic relationships. This approach eliminates the need for expensive retraining or distillation procedures typically required for creating compatible draft models, making it an efficient solution for accelerating inference through speculative decoding techniques.
 
 ## Features
@@ -11,7 +32,8 @@ This tool allows you to combine the transformer architecture and weights from a 
 - Automatic special tokens mapping between models.
 - User-specified manual token mapping overrides.
 - (**only useful for fine-tuning**) Models can be "trimmed" by removing a range of layers.
-- (**only useful for fine-tuning**) Models can be "trimmed" by reducing the hidden state dimension of the MLP blocks.
+- (**only useful for fine-tuning**) Models can be "trimmed" by reducing the hidden state dimension.
+- (**only useful for fine-tuning**) Models can be "trimmed" by reducing the MLP's intermediate dimension.
 
 ## Installation
 
@@ -39,14 +61,13 @@ python transplant_vocab.py /path/to/donor_model /path/to/target_model /path/to/o
 | `--override TARGET DONOR` | Override target token with donor sequence (can be used multiple times) |
 | `--weighting-decay-factor [0-1]` | Decay factor for multi-token mappings: 0=first token only, 0.5=decreasing weights, 1=uniform mean |
 | `--trim-layers START-END` | Trim out a range of layers from the model: start-end (inclusive) |
-| `--trim-intermediate-size SIZE` | Trim the hidden state dimension of the MLP blocks |
+| `--trim-hidden-size SIZE` | Trim the hidden state dimension (and the number of heads as a result) |
+| `--trim-intermediate-size SIZE` | Trim the intermediate dimension of the MLP blocks |
+| `--patch-missing-bos` | Patch `tokenizer_config.json` for models like `Qwen` which don't use any `<BOS>` token |
 | `--use-cpu-only` | Use CPU instead of GPU (and with `float32` precision) |
 | `--trust-remote-code` | Allow custom code execution when loading models with non-standard architectures |
-| `--patch-missing-bos` | Patch `tokenizer_config.json` for models like `Qwen` which don't use any `<BOS>` token |
 | `--overwrite` | Replace existing output directory |
 | `--verbose` | Show detailed token mapping output |
-
-**NOTE**: Some models like `Qwen` don't use any `<BOS>` type token, so you can try to use the experimental option `--patch-missing-bos` to manually patch `tokenizer_config.json` to fix this. This may or may not be a good idea; depending on the backend you ultimately want to use the speculative model with and/or if you intend to fine-tune the model afterwards.
 
 ### Examples
 
@@ -95,24 +116,42 @@ this leaves a model with 16 layer in total; 14 taken from the start and 2 from t
 Trimming layers 14 through 21 (inclusive): 
 - Old layer count : 24 (layers 0-23)
 - New layer count : 16 (keeping layers 0-13 and 22-23)
-- Removed a total of 96 tensors from state_dict.
-- Updated model configuration so `num_hidden_layers = 16`.
+- Removed 96 tensors from state_dict
+- Renamed 192 layer tensors to new indices
+- Updated model configuration: num_hidden_layers = 16
 ```
 
-#### Reduce the intermediate size to 2432 (from 4864):
+#### Reduce the hidden size (and the number of attention heads):
 
 ```bash
-python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-small --trim-intermediate-size 2432
+python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-small --trim-hidden-size 768
 ```
 
-to create a significantly smaller model:
+to create a smaller model with less attention heads:
 
 ```
-Trimming intermediate size from 4864 to 2432: 
+Trimming hidden size from 896 to 768: 
+- Old hidden size : 896
+- New hidden size : 768
+- Updated model configuration: hidden_size = 768
+- Updated model configuration: num_attention_heads = 12
+- Trimmed 243 tensors in state_dict
+```
+
+#### Reduce the intermediate size:
+
+```bash
+python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B-small --trim-intermediate-size 3072
+```
+
+to create a smaller model:
+
+```
+Trimming intermediate size from 4864 to 3072: 
 - Old intermediate size : 4864
-- New intermediate size : 2432
+- New intermediate size : 3072
+- Updated model configuration: intermediate_size = 3072
 - Trimmed 72 tensors in state_dict
-- Updated model configuration so `intermediate_size = 2432`
 ```
 
 ### Token Mapping
@@ -248,18 +287,44 @@ This keeps layers 0-13 (the first 14 layers) and layers 22-23 (the final 2 layer
 
 **IMPORTANT**: After layer trimming, you ***must fine-tune*** the model to recover performance.
 
-## Intermediate Size Trimming
+## Hidden and Intermediate Size Trimming
 
-The `--trim-intermediate-size` option allows you to reduce the hidden state dimension of the MLP blocks throughout the model. This can be useful for the same reasons as layer trimming.
+The `--trim-hidden-size` and `--trim-intermediate-size` options allows you to reduce the hidden state dimension (and the number of heads as a result), and the intermediate dimension of the MLP blocks throughout the model. This can be useful for the same reasons as layer trimming.
 
 ### Important Considerations
 
-- **Performance Impact**: Like layer trimming, reducing hidden state dimensions will impact model performance. The resulting model will require fine-tuning to recover acceptable performance.
-- **Recommended Approach**: When trimming intermediate size:
-  - Consider the ratio between the original and new size (e.g., reducing from 4864 to 2432 is a 50% reduction)
-  - Choose a size that is a multiple of 128 for compatibility with most hardware acceleration (e.g., 2432/128 = 19)
+- **Performance Impact**: Like layer trimming, reducing hidden/intermediate dimensions will impact model performance. The resulting model will require fine-tuning to recover acceptable performance.
+- **Recommended Approach**: When trimming hidden/intermediate size:
+  - Ensure the new hidden state dimension leaves a whole number of heads (eg: 512/896 * 14 = 8 heads after trimming)
+  - Consider the ratio between the original and new sizes (eg: reducing from 4864 to 2432 is a 50% reduction in intermediate size)
+  - Preferably, choose sizes that are a multiple of 128 for compatibility with hardware acceleration (eg: 2432/128 = 19 and 512/128 = 4, etc)
 
-**IMPORTANT**: After trimming intermediate size, you ***must fine-tune*** the model to recover performance.
+**IMPORTANT**: After trimming hidden/intermediate size, you ***must fine-tune*** the model to recover performance.
+
+## Handling Models Without BOS Tokens
+
+Some language models, like Qwen, don't use beginning-of-sequence (BOS) tokens in their tokenization strategy. This can cause issues when transplanting vocabularies between models with different tokenization approaches.
+
+The `--patch-missing-bos` option addresses this by:
+
+1. Modifying the `tokenizer_config.json` file to set `add_bos_token` to `false`
+2. Removing any references to `bos_token` from the Jinja chat template
+3. Ensuring the model doesn't automatically add BOS tokens where they aren't expected
+
+### When to Use This Option
+
+Use `--patch-missing-bos` when:
+- The donor model doesn't use BOS tokens but the target model does
+- You notice unexpected tokens at the beginning of generated sequences
+- You're working with models like Qwen that have specific tokenization strategies
+
+### Example
+
+```bash
+python transplant_vocab.py ./Qwen2.5-0.5B-Instruct ./DeepSeek-R1 ./DeepSeek-R1-DRAFT-0.5B --patch-missing-bos
+```
+
+This will patch the tokenizer configuration in the output model to handle the absence of BOS tokens properly.
 
 ## Design Rationale
 

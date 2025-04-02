@@ -672,31 +672,54 @@ def patch_tokenizer_config_bos(output_dir):
         except Exception as e:
             print(f"Warning: Failed to patch tokenizer configuration: {e}")
 
-def patch_config_dtype(output_dir, dtype):
+def patch_config_dtype(output_dir):
     """
-    Patch the config.json file with the specified dtype.
+    Patch the config.json file with the correct dtype based on what was actually saved in the safetensors file.
     
     Args:
-        output_dir: Path to the output directory containing the config.json
-        dtype: The dtype to set in the config file
+        output_dir: Path to the output directory containing the config.json and model files
     """
+    import json
+    from safetensors import safe_open
+
     config_path = os.path.join(output_dir, "config.json")
-    if os.path.exists(config_path):
-        print(f"\nPatching 'torch_dtype' in '{config_path}'")
-        try:
-            # Read the file as JSON
-            with open(config_path, "r") as f:
-                config = json.load(f)
+    model_path = os.path.join(output_dir, "model.safetensors")
 
-            # Update the dtype
-            config['torch_dtype'] = dtype
-            print(f"- Updated 'torch_dtype' to '{dtype}'.")
+    if not os.path.exists(config_path) or not os.path.exists(model_path):
+        print(f"Warning: Could not find config.json or model.safetensors in {output_dir}")
+        return
 
-            # Write the modified config back
-            with open(config_path, "w") as f:
-                json.dump(config, f, indent = 2)
-        except Exception as e:
-            print(f"Warning: Failed to patch config file: {e}")
+    print(f"\nPatching 'torch_dtype' in '{config_path}' based on actual saved tensors")
+
+    try:
+        # Open the safetensors file and check the dtype of a tensor
+        with safe_open(model_path, framework = "pt", device = "cpu") as f:
+            # Get the first tensor's dtype (embed_tokens is a good choice as it's always present)
+            for key in f.keys():
+                if "embed_tokens" in key:
+                    tensor = f.get_tensor(key)
+                    dtype_str = str(tensor.dtype).split('.')[-1]
+                    break
+            else:
+                # Fallback to any tensor if embed_tokens not found
+                key = list(f.keys())[0]
+                tensor = f.get_tensor(key)
+                dtype_str = str(tensor.dtype).split('.')[-1]
+
+        # Read the config file
+        with open(config_path, "r") as f:
+            config = json.load(f)
+
+        # Update the dtype
+        config['torch_dtype'] = dtype_str
+        print(f"- Updated 'torch_dtype' to '{dtype_str}' based on actual tensor dtype")
+
+        # Write the modified config back
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent = 2)
+
+    except Exception as e:
+        print(f"Warning: Failed to patch config file: {e}")
 
 def debug_model_tensors(model, state_dict):
     """
@@ -878,7 +901,7 @@ def main():
     target_tokenizer.save_pretrained(args.output_dir)
 
     # Patch the stupid `torch_dtype` bug in the config file where it always saves as float32 regardless of the actual type...
-    patch_config_dtype(args.output_dir, str(new_state_dict['model.embed_tokens.weight'].dtype).split('.')[-1])
+    patch_config_dtype(args.output_dir)
 
     # Attempt to patch the EOS stuff if the donor tokenizer doesn't use BOS tokens
     if args.patch_missing_bos and (getattr(donor_tokenizer, "add_bos_token", False)

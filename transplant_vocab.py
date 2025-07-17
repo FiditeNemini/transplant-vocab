@@ -7,6 +7,8 @@ All credit to turboderp for the original idea:
 https://huggingface.co/turboderp/Qwama-0.5B-Instruct/blob/main/vocab_transplant.py
 """
 
+from tqdm import tqdm
+from typing import Tuple, Dict
 import argparse
 import json
 import os
@@ -14,8 +16,6 @@ import re
 import shutil
 import sys
 import torch
-from tqdm import tqdm
-from typing import Tuple, Dict
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
@@ -24,33 +24,33 @@ import torch.nn as nn
 def parse_arguments() -> argparse.Namespace:
     """Parse and validate command line arguments"""
     parser = argparse.ArgumentParser(
-        description = "Transplant token embeddings between language models",
-        formatter_class = argparse.ArgumentDefaultsHelpFormatter
+        description="Transplant token embeddings between language models",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("donor_dir", help = "Path to donor model directory")
-    parser.add_argument("target_dir", help = "Path to target model directory")
-    parser.add_argument("output_dir", help = "Path to output model directory")
-    parser.add_argument("--override", nargs = 2, action = "append", default = [],
-                       help = "Override target token with donor sequence (can be used multiple times)")
-    parser.add_argument("--weighting-decay-factor", type = float, default = 0.5,
-                       help = "Decay factor [0-1] for multi-token mappings: "
+    parser.add_argument("donor_dir", help="Path to donor model directory")
+    parser.add_argument("target_dir", help="Path to target model directory")
+    parser.add_argument("output_dir", help="Path to output model directory")
+    parser.add_argument("--override", nargs=2, action="append", default=[],
+                       help="Override target token with donor sequence (can be used multiple times)")
+    parser.add_argument("--weighting-decay-factor", type=float, default=0.5,
+                       help="Decay factor [0-1] for multi-token mappings: "
                             "0=first token only, 0.5=decreasing weights, 1=uniform mean")
-    parser.add_argument("--trim-layers", type = str,
-                       help = "Trim out a range of layers from the model: start-end (inclusive)")
-    parser.add_argument("--trim-hidden-size", type = int,
-                       help = "Trim the hidden state dimension (and the number of heads as a result)")
-    parser.add_argument("--trim-intermediate-size", type = int,
-                       help = "Trim the intermediate dimension of the MLP blocks")
-    parser.add_argument("--use-cpu-only", action = "store_true",
-                       help = "Use CPU only for model loading and processing in float32")
-    parser.add_argument("--trust-remote-code", action = "store_true",
-                       help = "Allow custom code execution when loading models with non-standard architectures")
-    parser.add_argument("--patch-missing-bos", action = "store_true",
-                       help = "Patch `tokenizer_config.json` for models like `Qwen` which don't use any `<BOS>` token")
-    parser.add_argument("--overwrite", action = "store_true",
-                       help = "Overwrite output directory if it exists")
-    parser.add_argument("--verbose", action = "store_true",
-                       help = "Show detailed token mapping output")
+    parser.add_argument("--trim-layers", type=str,
+                       help="Trim out a range of layers from the model: start-end (inclusive)")
+    parser.add_argument("--trim-hidden-size", type=int,
+                       help="Trim the hidden state dimension (and the number of heads as a result)")
+    parser.add_argument("--trim-intermediate-size", type=int,
+                       help="Trim the intermediate dimension of the MLP blocks")
+    parser.add_argument("--use-cpu-only", action="store_true",
+                       help="Use CPU only for model loading and processing in float32")
+    parser.add_argument("--trust-remote-code", action="store_true",
+                       help="Allow custom code execution when loading models with non-standard architectures")
+    parser.add_argument("--patch-missing-bos", action="store_true",
+                       help="Patch `tokenizer_config.json` for models like `Qwen` which don't use any `<BOS>` token")
+    parser.add_argument("--overwrite", action="store_true",
+                       help="Overwrite output directory if it exists")
+    parser.add_argument("--verbose", action="store_true",
+                       help="Show detailed token mapping output")
 
     args = parser.parse_args()
 
@@ -84,7 +84,7 @@ def validate_directories(args: argparse.Namespace) -> None:
             sys.exit(f"Error: Output directory exists (use --overwrite to replace): {args.output_dir}")
 
     try:
-        os.makedirs(args.output_dir, exist_ok = True)
+        os.makedirs(args.output_dir, exist_ok=True)
     except OSError as e:
         sys.exit(f"Error: Failed to create output directory: {e}")
 
@@ -95,8 +95,8 @@ def load_model_config(path: str) -> dict:
         sys.exit(f"Error: Config file not found at {config_path}")
 
     try:
-        print(f"Loading config from '{path}'... ", end = "")
-        with open(config_path, "r", encoding = "utf-8") as f:
+        print(f"Loading config from '{path}'... ", end="")
+        with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
         print("Done.")
     except Exception as e:
@@ -104,33 +104,33 @@ def load_model_config(path: str) -> dict:
 
     return config
 
-def load_tokenizer(path: str, trust_remote_code = False) -> AutoTokenizer:
+def load_tokenizer(path: str, trust_remote_code=False) -> AutoTokenizer:
     """Load tokenizer with error handling"""
     try:
-        print(f"Loading tokenizer from '{path}'... ", end = "")
-        tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code = trust_remote_code)
+        print(f"Loading tokenizer from '{path}'... ", end="")
+        tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=trust_remote_code)
         print("Done.")
         return tokenizer
     except Exception as e:
         sys.exit(f"Failed to load tokenizer: {e}")
 
-def load_model(path: str, trust_remote_code = False, use_cpu_only = False) -> AutoModelForCausalLM:
+def load_model(path: str, trust_remote_code=False, use_cpu_only=False) -> AutoModelForCausalLM:
     """Load model with error handling"""
     try:
-        print(f"Loading model from '{path}'... ", end = "")
+        print(f"Loading model from '{path}'... ", end="")
         if use_cpu_only:
             model = AutoModelForCausalLM.from_pretrained(
                 path,
-                trust_remote_code = trust_remote_code,
-                device_map = 'cpu',
-                torch_dtype = 'float32',
+                trust_remote_code=trust_remote_code,
+                device_map='cpu',
+                torch_dtype='float32',
             )
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 path,
-                trust_remote_code = trust_remote_code,
-                device_map = 'auto',
-                torch_dtype = 'auto',
+                trust_remote_code=trust_remote_code,
+                device_map='auto',
+                torch_dtype='auto',
             )
         print("Done.")
         return model
@@ -140,10 +140,10 @@ def load_model(path: str, trust_remote_code = False, use_cpu_only = False) -> Au
 def count_model_parameters(model) -> Tuple[int, int, int]:
     """
     Count the total number of parameters in a model.
-    
+
     Args:
         model: The model to analyze
-        
+
     Returns:
         Tuple of (total parameters, embedding and LM head parameters only,
                  parameters excluding embeddings and LM head)
@@ -170,7 +170,7 @@ def has_config_value(config, key: str) -> bool:
         return key in config or ("text_config" in config and key in config["text_config"])
     return hasattr(config, key) or (hasattr(config, "text_config") and hasattr(config.text_config, key))
 
-def get_config_value(config, key: str, default = ...):
+def get_config_value(config, key: str, default=...):
     """Get a value from a model configuration, handling both flat and nested structures"""
     assert default is not ... or has_config_value(config, key), f"{key} not found in model configuration"
     if not has_config_value(config, key):
@@ -193,16 +193,16 @@ def set_config_value(config, key: str, value):
         if hasattr(config, "text_config") and hasattr(config.text_config, key):
             setattr(config.text_config, key, value)
 
-def process_automatic_token_overrides(target_tokenizer, donor_tokenizer, target_config, donor_config, existing_map = None):
+def process_automatic_token_overrides(target_tokenizer, donor_tokenizer, target_config, donor_config, existing_map=None):
     """
     Process automatic token overrides for special tokens.
-    
+
     Args:
         target_tokenizer: The target tokenizer
         donor_tokenizer: The donor tokenizer
         target_config: The target model configuration
         donor_config: The donor model configuration
-        
+
     Returns:
         Dictionary mapping target token IDs to donor token IDs
     """
@@ -228,7 +228,7 @@ def process_automatic_token_overrides(target_tokenizer, donor_tokenizer, target_
                 if target_token_id not in override_map:
                     target_token = target_tokenizer.convert_ids_to_tokens(target_token_id)
                     donor_token = donor_tokenizer.convert_ids_to_tokens(donor_token_id)
-                    override_map[target_token_id] = torch.tensor([donor_token_id], dtype = torch.long)
+                    override_map[target_token_id] = torch.tensor([donor_token_id], dtype=torch.long)
                     print(f"✔ {repr(token_attr)} : {target_token_id} {repr(target_token)} → [{donor_token_id}] {repr(donor_token)}")
                 else:
                     print(f"✘ {repr(token_attr)} : {target_token_id} is already mapped to [{override_map[target_token_id].item()}]")
@@ -239,16 +239,16 @@ def process_automatic_token_overrides(target_tokenizer, donor_tokenizer, target_
 
     return override_map
 
-def process_manual_token_overrides(target_tokenizer, donor_tokenizer, manual_overrides, existing_map = None):
+def process_manual_token_overrides(target_tokenizer, donor_tokenizer, manual_overrides, existing_map=None):
     """
     Process manual token overrides specified by the user.
-    
+
     Args:
         target_tokenizer: The target tokenizer
         donor_tokenizer: The donor tokenizer
         manual_overrides: List of (target_token, donor_tokens) pairs
         existing_map: Existing override map to update (optional)
-        
+
     Returns:
         Updated dictionary mapping target token IDs to donor token IDs
     """
@@ -260,7 +260,7 @@ def process_manual_token_overrides(target_tokenizer, donor_tokenizer, manual_ove
     print(f"\nProcessing {len(manual_overrides)} manual token overrides:")
     for target_token, donor_tokens in manual_overrides:
         # Encode target token and verify it's a single token
-        target_id = target_tokenizer.encode(target_token, add_special_tokens = False)
+        target_id = target_tokenizer.encode(target_token, add_special_tokens=False)
         assert len(target_id) == 1, f"Target token '{target_token}' maps to {len(target_id)} tokens. Must be a 1 token."
         target_id = target_id[0]
 
@@ -270,7 +270,7 @@ def process_manual_token_overrides(target_tokenizer, donor_tokenizer, manual_ove
             donor_tokens = donor_tokens.replace("\\n", chr(10))
 
         # Get the IDs from the token string
-        encoded = donor_tokenizer.encode(donor_tokens, add_special_tokens = False, return_tensors = "pt").flatten()
+        encoded = donor_tokenizer.encode(donor_tokens, add_special_tokens=False, return_tensors="pt").flatten()
         assert encoded.numel() != 0, f"Donor token '{donor_tokens}' for target ID {target_id} encodes to 0 tokens."
 
         # Store the donor token IDs
@@ -280,17 +280,17 @@ def process_manual_token_overrides(target_tokenizer, donor_tokenizer, manual_ove
 
     return override_map
 
-def compute_front_loaded_mean(v, weighting_decay_factor = 0.5):
+def compute_front_loaded_mean(v, weighting_decay_factor=0.5):
     """
     Computes the "front-loaded" exponentially-weighted mean with a weighting decay factor.
-    
+
     Parameters:
     - v: torch tensor with values
     - weighting_decay_factor: parameter in [0, 1] controlling how quickly weights decay for subsequent vectors
-    
+
     Returns:
     - Weighted average tensor
-    
+
     Special cases:
     - weighting_decay_factor=0   : Returns only the first vector (maximum front-loading)
     - weighting_decay_factor=0.5 : Applies weights 1, 0.5, 0.25, 0.125, ... (earlier vectors have more influence)
@@ -304,21 +304,21 @@ def compute_front_loaded_mean(v, weighting_decay_factor = 0.5):
     if n == 1 or weighting_decay_factor == 0:
         return v[0]  # First (or only) vector only
     elif weighting_decay_factor == 1:
-        return torch.mean(v, dim = 0)  # Arithmetic mean
+        return torch.mean(v, dim=0)  # Arithmetic mean
     else:
         # Compute the weights using geometric progression
-        decay_powers = torch.tensor([weighting_decay_factor ** i for i in range(n)], device = v.device)
+        decay_powers = torch.tensor([weighting_decay_factor ** i for i in range(n)], device=v.device)
         decay_powers = decay_powers.view(-1, *([1] * (v.dim() - 1)))
-        weighted_sum = torch.sum(decay_powers * v, dim = 0)
+        weighted_sum = torch.sum(decay_powers * v, dim=0)
         denominator = torch.sum(decay_powers)
         return weighted_sum / denominator
 
 def transplant_tokens(model, donor_config, target_tokenizer, donor_tokenizer,
                       override_map, vocab_size, used_vocab_size,
-                      weighting_decay_factor, verbose = False):
+                      weighting_decay_factor, verbose=False):
     """
     Transplant token embeddings from donor model to target vocabulary.
-    
+
     Args:
         model: The donor model
         donor_config: The donor model configuration
@@ -329,7 +329,7 @@ def transplant_tokens(model, donor_config, target_tokenizer, donor_tokenizer,
         used_vocab_size: Number of tokens actually used in the target vocabulary
         weighting_decay_factor: Factor for weighting multi-token mappings
         verbose: Whether to print detailed mapping information
-        
+
     Returns:
         Tuple of (new state dict, embedding statistics)
     """
@@ -348,13 +348,13 @@ def transplant_tokens(model, donor_config, target_tokenizer, donor_tokenizer,
     # Initialize new embedding and head tensors with zeros
     new_embed_tokens = torch.zeros(
         (vocab_size, donor_hidden_size),
-        dtype = donor_embed_tokens.dtype,
-        device = donor_embed_tokens.device
+        dtype=donor_embed_tokens.dtype,
+        device=donor_embed_tokens.device
     )
     new_lm_head = torch.zeros(
         (vocab_size, donor_hidden_size),
-        dtype = donor_lm_head.dtype,
-        device = donor_lm_head.device
+        dtype=donor_lm_head.dtype,
+        device=donor_lm_head.device
     )
 
     # Track mapping statistics
@@ -367,14 +367,14 @@ def transplant_tokens(model, donor_config, target_tokenizer, donor_tokenizer,
     if verbose:
         print("Transplanting tokens:")
     else:
-        iterator = tqdm(iterator, desc = "Transplanting tokens", unit = "token")
+        iterator = tqdm(iterator, desc="Transplanting tokens", unit="token")
 
     for idx in iterator:
-        decoded = target_tokenizer.decode([idx], decode_special_tokens = True)
+        decoded = target_tokenizer.decode([idx], decode_special_tokens=True)
         if idx in override_map:
             encoded = override_map[idx]
         else:
-            encoded = donor_tokenizer.encode(decoded, add_special_tokens = False, return_tensors = "pt").flatten()
+            encoded = donor_tokenizer.encode(decoded, add_special_tokens=False, return_tensors="pt").flatten()
 
         if verbose:
             print(f"- {idx:6d} : {repr(decoded)} → {encoded.tolist()}")
@@ -414,21 +414,21 @@ def transplant_tokens(model, donor_config, target_tokenizer, donor_tokenizer,
     old_dtype = model.model.embed_tokens.weight.dtype
 
     # Update the state_dict with new embeddings
-    new_state_dict['model.embed_tokens.weight'] = new_embed_tokens.to(dtype = old_dtype)
-    new_state_dict['lm_head.weight'] = new_lm_head.to(dtype = old_dtype)
+    new_state_dict['model.embed_tokens.weight'] = new_embed_tokens.to(dtype=old_dtype)
+    new_state_dict['lm_head.weight'] = new_lm_head.to(dtype=old_dtype)
 
     return new_state_dict
 
 def trim_model_layers(model, state_dict, start_layer, end_layer):
     """
     Trim out a range of layers from the model and its state_dict.
-    
+
     Args:
         model: The model to modify
         state_dict: The state dictionary to modify
         start_layer: The first layer to remove (inclusive)
         end_layer: The last layer to remove (inclusive)
-    
+
     Returns:
         Tuple of (modified model, modified state_dict)
     """
@@ -512,12 +512,12 @@ def trim_model_layers(model, state_dict, start_layer, end_layer):
 def trim_tensors(state_dict, old_size, new_size):
     """
     Trim all tensors in a state dictionary that have dimensions matching old_size.
-    
+
     Args:
         state_dict: The state dictionary to modify
         old_size: The original dimension size to look for
         new_size: The new dimension size to trim to
-    
+
     Returns:
         Tuple of (new state dict, count of trimmed tensors)
     """
@@ -538,16 +538,16 @@ def trim_tensors(state_dict, old_size, new_size):
             if len(new_shape) == 1:
                 new_tensor = torch.zeros(
                     new_shape[0],
-                    dtype = tensor.dtype,
-                    device = tensor.device
+                    dtype=tensor.dtype,
+                    device=tensor.device
                 )
                 # Copy data from the original tensor
                 new_tensor[:] = tensor[:new_size]
             elif len(new_shape) == 2:
                 new_tensor = torch.zeros(
                     new_shape[0], new_shape[1],
-                    dtype = tensor.dtype,
-                    device = tensor.device
+                    dtype=tensor.dtype,
+                    device=tensor.device
                 )
                 # Copy data based on which dimensions need trimming
                 if tensor.shape[0] == old_size and tensor.shape[1] == old_size:
@@ -560,8 +560,8 @@ def trim_tensors(state_dict, old_size, new_size):
                 # For higher dimensional tensors
                 new_tensor = torch.zeros(
                     new_shape,
-                    dtype = tensor.dtype,
-                    device = tensor.device
+                    dtype=tensor.dtype,
+                    device=tensor.device
                 )
                 # Create slices for copying
                 src_slices = tuple(slice(0, new_shape[i]) if tensor.shape[i] == old_size else slice(None)
@@ -580,12 +580,12 @@ def trim_tensors(state_dict, old_size, new_size):
 def trim_model_hidden_size(model, state_dict, new_size):
     """
     Trim the hidden state dimension of the residual stream.
-    
+
     Args:
         model: The model to modify
         state_dict: The state dictionary to modify
         new_size: The new hidden state dimension to use
-    
+
     Returns:
         Tuple of (modified model, modified state_dict)
     """
@@ -618,12 +618,12 @@ def trim_model_hidden_size(model, state_dict, new_size):
 def trim_model_intermediate_size(model, state_dict, new_size):
     """
     Trim the hidden state dimension of the MLP blocks.
-    
+
     Args:
         model: The model to modify
         state_dict: The state dictionary to modify
         new_size: The new hidden state dimension to use
-    
+
     Returns:
         Tuple of (modified model, modified state_dict)
     """
@@ -645,7 +645,7 @@ def trim_model_intermediate_size(model, state_dict, new_size):
 def patch_tokenizer_config_bos(output_dir):
     """
     Patch the tokenizer configuration to handle models without BOS tokens.
-    
+
     Args:
         output_dir: Path to the output directory containing the tokenizer_config.json
     """
@@ -675,7 +675,7 @@ def patch_tokenizer_config_bos(output_dir):
 def patch_config_dtype(output_dir):
     """
     Patch the config.json file with the correct dtype based on what was actually saved in the safetensors file.
-    
+
     Args:
         output_dir: Path to the output directory containing the config.json and model files
     """
@@ -693,7 +693,7 @@ def patch_config_dtype(output_dir):
 
     try:
         # Open the safetensors file and check the dtype of a tensor
-        with safe_open(model_path, framework = "pt", device = "cpu") as f:
+        with safe_open(model_path, framework="pt", device="cpu") as f:
             # Get the first tensor's dtype (embed_tokens is a good choice as it's always present)
             for key in f.keys():
                 if "embed_tokens" in key:
@@ -716,7 +716,7 @@ def patch_config_dtype(output_dir):
 
         # Write the modified config back
         with open(config_path, "w") as f:
-            json.dump(config, f, indent = 2)
+            json.dump(config, f, indent=2)
 
     except Exception as e:
         print(f"Warning: Failed to patch config file: {e}")
@@ -725,7 +725,7 @@ def debug_model_tensors(model, state_dict):
     """
     Print detailed information about model parameters and state dict tensors
     to help debug shape mismatches.
-    
+
     Args:
         model: The model to inspect
         state_dict: The state dictionary to inspect
@@ -791,8 +791,13 @@ def main():
     model = load_model(args.donor_dir, args.trust_remote_code, args.use_cpu_only)
 
     # The config file counts the all tokens, but we also need to know how many are used for the loop
-    used_target_vocab_size = max(target_tokenizer.vocab.values()) + 1
-    unused_target_vocab_size = target_vocab_size - used_target_vocab_size
+    if hasattr(target_tokenizer, 'vocab'):
+        used_target_vocab_size = max(target_tokenizer.vocab.values()) + 1
+        unused_target_vocab_size = target_vocab_size - used_target_vocab_size
+    else:
+        # For TikToken tokenizers (eg: Kimi-K2-Instruct), just use the full vocabulary size
+        used_target_vocab_size = target_vocab_size
+        unused_target_vocab_size = 0
 
     # Count parameters in donor model
     donor_total_params, donor_embedding_params, donor_non_embedding_params = count_model_parameters(model)
@@ -822,15 +827,15 @@ def main():
 
     # Transplant tokens from donor model to target vocabulary
     new_state_dict = transplant_tokens(
-        model = model,
-        donor_config = donor_config,
-        target_tokenizer = target_tokenizer,
-        donor_tokenizer = donor_tokenizer,
-        override_map = override_map,
-        vocab_size = target_vocab_size,
-        used_vocab_size = used_target_vocab_size,
-        weighting_decay_factor = args.weighting_decay_factor,
-        verbose = args.verbose
+        model=model,
+        donor_config=donor_config,
+        target_tokenizer=target_tokenizer,
+        donor_tokenizer=donor_tokenizer,
+        override_map=override_map,
+        vocab_size=target_vocab_size,
+        used_vocab_size=used_target_vocab_size,
+        weighting_decay_factor=args.weighting_decay_factor,
+        verbose=args.verbose
     )
 
     # Trim layers if requested
@@ -897,7 +902,7 @@ def main():
 
     # Save final model and tokenizer
     print(f"\nSaving model and tokenizer to '{args.output_dir}' folder")
-    model.save_pretrained(args.output_dir, state_dict = new_state_dict, safe_serialization = True)
+    model.save_pretrained(args.output_dir, state_dict=new_state_dict, safe_serialization=True)
     target_tokenizer.save_pretrained(args.output_dir)
 
     # Patch the stupid `torch_dtype` bug in the config file where it always saves as float32 regardless of the actual type...

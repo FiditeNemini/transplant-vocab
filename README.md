@@ -66,8 +66,13 @@ python transplant_vocab.py /path/to/donor_model /path/to/target_model /path/to/o
 | `--patch-missing-bos` | Patch `tokenizer_config.json` for models like `Qwen` which don't use any `<BOS>` token |
 | `--use-cpu-only` | Use CPU instead of GPU (and with `float32` precision) |
 | `--trust-remote-code` | Allow custom code execution when loading models with non-standard architectures |
+| `--untie-word-embeddings` | Force-untying: create a separate `lm_head` even if the donor model uses tied embeddings (default preserves donor tying) |
 | `--overwrite` | Replace existing output directory |
 | `--verbose` | Show detailed token mapping output |
+
+Note on tied vs untied embeddings:
+- By default, the tool preserves the donor model’s embedding–head tying. If the donor uses tied embeddings, the output will remain tied; pass `--untie-word-embeddings` to force a separate `lm_head`.
+- If the donor uses untied embeddings, the output remains untied.
 
 ### Examples
 
@@ -361,6 +366,8 @@ We use **D** (**MOSTLY** the first token) because:
 3. We choose to use `0.5` as the default because:
    - Using only the first token creates probability mass inflation for repeated prefixes.
    - Using a uniform mean inappropriately gives too much weight to trailing tokens.
+
+When preserving tied embeddings (default if the donor is tied), this averaging strategy is applied to `embed_tokens` directly, and no separate `lm_head.weight` is saved; on load, the head is tied to the embeddings.
 
 ### Mathematical Considerations
 

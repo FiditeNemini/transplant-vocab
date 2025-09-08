@@ -47,6 +47,8 @@ def parse_arguments() -> argparse.Namespace:
                        help="Allow custom code execution when loading models with non-standard architectures")
     parser.add_argument("--patch-missing-bos", action="store_true",
                        help="Patch `tokenizer_config.json` for models like `Qwen` which don't use any `<BOS>` token")
+    parser.add_argument("--untie-word-embeddings", action="store_true",
+                       help="Force-untying: create a separate lm_head even if donor model uses tied embeddings; default preserves donor tying")
     parser.add_argument("--overwrite", action="store_true",
                        help="Overwrite output directory if it exists")
     parser.add_argument("--verbose", action="store_true",
@@ -315,7 +317,7 @@ def compute_front_loaded_mean(v, weighting_decay_factor=0.5):
 
 def transplant_tokens(model, donor_config, target_tokenizer, donor_tokenizer,
                       override_map, vocab_size, used_vocab_size,
-                      weighting_decay_factor, verbose=False):
+                      weighting_decay_factor, untie_word_embeddings=False, verbose=False):
     """
     Transplant token embeddings from donor model to target vocabulary.
 
@@ -328,6 +330,7 @@ def transplant_tokens(model, donor_config, target_tokenizer, donor_tokenizer,
         vocab_size: Total size of the target vocabulary
         used_vocab_size: Number of tokens actually used in the target vocabulary
         weighting_decay_factor: Factor for weighting multi-token mappings
+        untie_word_embeddings: If True, force an untied lm_head even if donor used tied embeddings
         verbose: Whether to print detailed mapping information
 
     Returns:
@@ -338,12 +341,19 @@ def transplant_tokens(model, donor_config, target_tokenizer, donor_tokenizer,
 
     # Get donor embeddings
     donor_embed_tokens = model.model.embed_tokens.weight
-    if get_config_value(donor_config, "tie_word_embeddings", False):
-        print("\nNOTE: Using an \"untied\" copy of 'embed_tokens.weight' as new 'lm_head.weight' tensor...\n")
-        donor_lm_head = model.model.embed_tokens.weight
+    donor_tied = get_config_value(donor_config, "tie_word_embeddings", False)
+    use_separate_head = (not donor_tied) or untie_word_embeddings
+
+    if use_separate_head:
+        if donor_tied:
+            print("\nNOTE: Using an \"untied\" copy of 'embed_tokens.weight' as new 'lm_head.weight' tensor...\n")
+            donor_lm_head = donor_embed_tokens
+        else:
+            print("\nNOTE: Using actual 'lm_head.weight' tensor as donor not configured with 'tie_word_embeddings...\n")
+            donor_lm_head = model.lm_head.weight
     else:
-        print("\nNOTE: Using actual 'lm_head.weight' tensor as donor not configured with 'tie_word_embeddings...\n")
-        donor_lm_head = model.lm_head.weight
+        print("\nNOTE: Preserving tied word embeddings; applying front-loaded mean to 'embed_tokens'; no separate 'lm_head.weight' will be saved...\n")
+        donor_lm_head = None
 
     # Initialize new embedding and head tensors with zeros
     new_embed_tokens = torch.zeros(
@@ -353,8 +363,8 @@ def transplant_tokens(model, donor_config, target_tokenizer, donor_tokenizer,
     )
     new_lm_head = torch.zeros(
         (vocab_size, donor_hidden_size),
-        dtype=donor_lm_head.dtype,
-        device=donor_lm_head.device
+        dtype=(donor_embed_tokens.dtype if donor_lm_head is None else donor_lm_head.dtype),
+        device=(donor_embed_tokens.device if donor_lm_head is None else donor_lm_head.device)
     )
 
     # Track mapping statistics
@@ -385,17 +395,28 @@ def transplant_tokens(model, donor_config, target_tokenizer, donor_tokenizer,
         else:
             mapping_counts[encoded.numel()] = 1
 
-        # Use only the final token of encoded sequence for input embeddings
-        new_embed_tokens[idx] = donor_embed_tokens[encoded[-1]]
+        if use_separate_head:
+            # Use only the final token of encoded sequence for input embeddings
+            new_embed_tokens[idx] = donor_embed_tokens[encoded[-1]]
 
-        # Use a "front-loaded" exponentially-weighted mean for lm_head embeddings
-        if encoded.numel() == 1:
-            new_lm_head[idx] = donor_lm_head[encoded[0].item()]
-            lm_head_copy_count += 1
+            # Use a "front-loaded" exponentially-weighted mean for lm_head embeddings
+            if encoded.numel() == 1:
+                new_lm_head[idx] = donor_lm_head[encoded[0].item()]
+                lm_head_copy_count += 1
+            else:
+                head_embeddings = donor_lm_head[encoded.flatten()]
+                new_lm_head[idx] = compute_front_loaded_mean(head_embeddings, weighting_decay_factor)
+                lm_head_mean_count += 1
         else:
-            head_embeddings = donor_lm_head[encoded.flatten()]
-            new_lm_head[idx] = compute_front_loaded_mean(head_embeddings, weighting_decay_factor)
-            lm_head_mean_count += 1
+            # Preserve tying: apply front-loaded mean directly to embed_tokens; mirror to lm_head
+            if encoded.numel() == 1:
+                new_embed_tokens[idx] = donor_embed_tokens[encoded[0].item()]
+                lm_head_copy_count += 1
+            else:
+                emb_stack = donor_embed_tokens[encoded.flatten()]
+                new_embed_tokens[idx] = compute_front_loaded_mean(emb_stack, weighting_decay_factor)
+                lm_head_mean_count += 1
+            new_lm_head[idx] = new_embed_tokens[idx]
 
     # Print statistics
     print("\nTransplant mappings:")
@@ -415,7 +436,14 @@ def transplant_tokens(model, donor_config, target_tokenizer, donor_tokenizer,
 
     # Update the state_dict with new embeddings
     new_state_dict['model.embed_tokens.weight'] = new_embed_tokens.to(dtype=old_dtype)
-    new_state_dict['lm_head.weight'] = new_lm_head.to(dtype=old_dtype)
+    # Only include a separate lm_head when we're untying or donor was already untied.
+    # When preserving tying, ensure lm_head is not saved separately.
+    if 'use_separate_head' in locals() and use_separate_head:
+        new_state_dict['lm_head.weight'] = new_lm_head.to(dtype=old_dtype)
+    else:
+        # Remove any existing lm_head.weight copied from the donor state dict
+        if 'lm_head.weight' in new_state_dict:
+            del new_state_dict['lm_head.weight']
 
     return new_state_dict
 
@@ -835,6 +863,7 @@ def main():
         vocab_size=target_vocab_size,
         used_vocab_size=used_target_vocab_size,
         weighting_decay_factor=args.weighting_decay_factor,
+        untie_word_embeddings=args.untie_word_embeddings,
         verbose=args.verbose
     )
 
@@ -867,9 +896,13 @@ def main():
         else:
             set_config_value(model.config, 'pad_token_id', target_tokenizer.eos_token_id)  # Default to EOS if no PAD to copy
 
-    # Set the config's tie_word_embeddings to False if it exists
+    # Set the config's tie_word_embeddings based on requested behavior
     if has_config_value(model.config, 'tie_word_embeddings'):
-        set_config_value(model.config, 'tie_word_embeddings', False)
+        if args.untie_word_embeddings:
+            set_config_value(model.config, 'tie_word_embeddings', False)
+        else:
+            # Preserve donor setting
+            set_config_value(model.config, 'tie_word_embeddings', get_config_value(donor_config, 'tie_word_embeddings', False))
 
     # Re-initialize the model with the updated configuration
     # NOTE: This seems to be more robust that just altering the model and state dict parameters

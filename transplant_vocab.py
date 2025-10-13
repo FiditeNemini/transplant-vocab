@@ -355,16 +355,18 @@ def transplant_tokens(model, donor_config, target_tokenizer, donor_tokenizer,
         print("\nNOTE: Preserving tied word embeddings; applying front-loaded mean to 'embed_tokens'; no separate 'lm_head.weight' will be saved...\n")
         donor_lm_head = None
 
-    # Initialize new embedding and head tensors with zeros
+    # Initialize new embeddings
     new_embed_tokens = torch.zeros(
         (vocab_size, donor_hidden_size),
         dtype=donor_embed_tokens.dtype,
         device=donor_embed_tokens.device
     )
-    new_lm_head = torch.zeros(
+    # Only allocate new_lm_head if we will save a separate head
+    if use_separate_head:
+        new_lm_head = torch.zeros(
         (vocab_size, donor_hidden_size),
-        dtype=(donor_embed_tokens.dtype if donor_lm_head is None else donor_lm_head.dtype),
-        device=(donor_embed_tokens.device if donor_lm_head is None else donor_lm_head.device)
+        dtype=donor_lm_head.dtype,
+        device=donor_lm_head.device
     )
 
     # Track mapping statistics
@@ -416,7 +418,6 @@ def transplant_tokens(model, donor_config, target_tokenizer, donor_tokenizer,
                 emb_stack = donor_embed_tokens[encoded.flatten()]
                 new_embed_tokens[idx] = compute_front_loaded_mean(emb_stack, weighting_decay_factor)
                 lm_head_mean_count += 1
-            new_lm_head[idx] = new_embed_tokens[idx]
 
     # Print statistics
     print("\nTransplant mappings:")
@@ -438,10 +439,9 @@ def transplant_tokens(model, donor_config, target_tokenizer, donor_tokenizer,
     new_state_dict['model.embed_tokens.weight'] = new_embed_tokens.to(dtype=old_dtype)
     # Only include a separate lm_head when we're untying or donor was already untied.
     # When preserving tying, ensure lm_head is not saved separately.
-    if 'use_separate_head' in locals() and use_separate_head:
+    if use_separate_head:
         new_state_dict['lm_head.weight'] = new_lm_head.to(dtype=old_dtype)
     else:
-        # Remove any existing lm_head.weight copied from the donor state dict
         if 'lm_head.weight' in new_state_dict:
             del new_state_dict['lm_head.weight']
 

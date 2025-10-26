@@ -47,8 +47,8 @@ def parse_arguments() -> argparse.Namespace:
                        help="Allow custom code execution when loading models with non-standard architectures")
     parser.add_argument("--patch-missing-bos", action="store_true",
                        help="Patch `tokenizer_config.json` for models like `Qwen` which don't use any `<BOS>` token")
-    parser.add_argument("--untie-word-embeddings", action="store_true",
-                       help="Force-untying: create a separate lm_head even if donor model uses tied embeddings; default preserves donor tying")
+    parser.add_argument("--keep-tied-word-embeddings", action="store_true",
+                       help="Keep tied word embeddings from donor model; default is to untie and create separate lm_head")
     parser.add_argument("--overwrite", action="store_true",
                        help="Overwrite output directory if it exists")
     parser.add_argument("--verbose", action="store_true",
@@ -863,7 +863,7 @@ def main():
         vocab_size=target_vocab_size,
         used_vocab_size=used_target_vocab_size,
         weighting_decay_factor=args.weighting_decay_factor,
-        untie_word_embeddings=args.untie_word_embeddings,
+        untie_word_embeddings=not args.keep_tied_word_embeddings,
         verbose=args.verbose
     )
 
@@ -898,7 +898,7 @@ def main():
 
     # Set the config's tie_word_embeddings based on requested behavior
     if has_config_value(model.config, 'tie_word_embeddings'):
-        if args.untie_word_embeddings:
+        if not args.keep_tied_word_embeddings:
             set_config_value(model.config, 'tie_word_embeddings', False)
         else:
             # Preserve donor setting

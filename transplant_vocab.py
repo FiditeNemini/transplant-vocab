@@ -387,6 +387,15 @@ def transplant_tokens(model, donor_config, target_tokenizer, donor_tokenizer,
             encoded = override_map[idx]
         else:
             encoded = donor_tokenizer.encode(decoded, add_special_tokens=False, return_tensors="pt").flatten()
+            # Fall back to the actual token string (preserves exact representation)
+            if encoded.numel() == 0 and hasattr(target_tokenizer, 'convert_ids_to_tokens'):
+                print(f"WARNING: Token {idx} {repr(decoded)} → empty, trying convert_ids_to_tokens()")
+                token_str = target_tokenizer.convert_ids_to_tokens(idx)
+                encoded = donor_tokenizer.encode(token_str, add_special_tokens=False, return_tensors="pt").flatten()
+            # Fall back to just using the EOS token as the last resort
+            if encoded.numel() == 0:
+                print(f"WARNING: Token {idx} → empty, using EOS [{donor_tokenizer.eos_token_id}] as fallback")
+                encoded = torch.tensor([donor_tokenizer.eos_token_id], dtype=torch.long)
 
         if verbose:
             print(f"- {idx:6d} : {repr(decoded)} → {encoded.tolist()}")
